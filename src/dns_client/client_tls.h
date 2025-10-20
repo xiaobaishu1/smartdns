@@ -49,6 +49,11 @@ int _ssl_shutdown(struct dns_server_info *server);
 
 int _ssl_do_handevent(struct dns_server_info *server);
 
+int _ssl_do_handshake(struct dns_server_info *server);
+
+int _ssl_get_error(struct dns_server_info *server, int ret);
+
+int _dns_client_tls_verify(struct dns_server_info *server_info);
 #ifdef __cplusplus
 }
 #endif /*__cplusplus */
