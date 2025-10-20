@@ -36,6 +36,154 @@
 #include <sys/ioctl.h>
 
 #if defined(OSSL_QUIC1_VERSION) && !defined (OPENSSL_NO_QUIC)
+static int _dns_client_quic_ssl_send_ext(struct dns_server_info *server, SSL *ssl, const void *buf, int num, uint64_t flags)
+{
+	int ret = 0;
+	int ssl_ret = 0;
+	unsigned long ssl_err = 0;
+	size_t written = 0;
+
+	if (ssl == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (num < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	pthread_mutex_lock(&server->lock);
+	if (server == NULL || buf == NULL || ssl == NULL) {
+		pthread_mutex_unlock(&server->lock);
+		return SSL_ERROR_SYSCALL;
+	}
+
+	ret = SSL_write_ex2(ssl, buf, num, flags, &written);
+	pthread_mutex_unlock(&server->lock);
+
+	if (ret > 0) {
+		return written;
+	}
+
+	ssl_ret = SSL_get_error(ssl, ret);
+	switch (ssl_ret) {
+	case SSL_ERROR_NONE:
+	case SSL_ERROR_ZERO_RETURN:
+		return 0;
+		break;
+	case SSL_ERROR_WANT_READ:
+		errno = EAGAIN;
+		ret = -SSL_ERROR_WANT_READ;
+		break;
+	case SSL_ERROR_WANT_WRITE:
+		errno = EAGAIN;
+		ret = -SSL_ERROR_WANT_WRITE;
+		break;
+	case SSL_ERROR_SSL: {
+		char buff[256];
+		ssl_err = ERR_get_error();
+		int ssl_reason = ERR_GET_REASON(ssl_err);
+
+		if (ssl_reason == SSL_R_UNEXPECTED_EOF_WHILE_READING ||
+			ssl_reason == SSL_R_STREAM_FINISHED) {
+			errno = ECONNRESET;
+			return -1;
+		}
+
+		if (ssl_reason == SSL_R_UNINITIALIZED || ssl_reason == SSL_R_PROTOCOL_IS_SHUTDOWN ||
+			ssl_reason == SSL_R_BAD_LENGTH || ssl_reason == SSL_R_SHUTDOWN_WHILE_IN_INIT ||
+			ssl_reason == SSL_R_BAD_WRITE_RETRY) {
+			errno = EAGAIN;
+			return -1;
+		}
+
+		tlog(TLOG_ERROR, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		errno = EFAULT;
+		ret = -1;
+	} break;
+	default:
+		errno = EFAULT;
+		ret = -1;
+		break;
+	}
+
+	return ret;
+}
+
+static int _dns_client_quic_ssl_recv_ext(struct dns_server_info *server, SSL *ssl, void *buf, int num)
+{
+	ssize_t ret = 0;
+	int ssl_ret = 0;
+	unsigned long ssl_err = 0;
+
+	if (ssl == NULL) {
+		errno = EFAULT;
+		return -1;
+	}
+
+	pthread_mutex_lock(&server->lock);
+	if (server == NULL || buf == NULL || ssl == NULL) {
+		pthread_mutex_unlock(&server->lock);
+		return -1;
+	}
+
+	ret = SSL_read(ssl, buf, num);
+	pthread_mutex_unlock(&server->lock);
+
+	if (ret > 0) {
+		return ret;
+	}
+
+	ssl_ret = SSL_get_error(ssl, ret);
+	switch (ssl_ret) {
+	case SSL_ERROR_NONE:
+	case SSL_ERROR_ZERO_RETURN:
+		return 0;
+		break;
+	case SSL_ERROR_WANT_READ:
+		errno = EAGAIN;
+		ret = -SSL_ERROR_WANT_READ;
+		break;
+	case SSL_ERROR_WANT_WRITE:
+		errno = EAGAIN;
+		ret = -SSL_ERROR_WANT_WRITE;
+		break;
+	case SSL_ERROR_SSL: {
+		char buff[256];
+		ssl_err = ERR_get_error();
+		int ssl_reason = ERR_GET_REASON(ssl_err);
+
+		switch (ssl_reason) {
+		case SSL_R_UNINITIALIZED:
+			errno = EAGAIN;
+			return -1;
+		case SSL_R_SHUTDOWN_WHILE_IN_INIT:
+		case SSL_R_PROTOCOL_IS_SHUTDOWN:
+		case SSL_R_STREAM_FINISHED:
+		case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+			return 0;
+		}
+
+		tlog(TLOG_ERROR, "server %s SSL read fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		errno = EFAULT;
+		ret = -1;
+	} break;
+	case SSL_ERROR_SYSCALL:
+		if (errno == 0) {
+			return 0;
+		}
+		ret = -1;
+		return ret;
+	default:
+		errno = EFAULT;
+		ret = -1;
+		break;
+	}
+
+	return ret;
+}
+
 static int _dns_client_quic_bio_recvmmsg(BIO *bio, BIO_MSG *msg, size_t stride, size_t num_msg, uint64_t flags,
 										 size_t *msgs_processed)
 {
@@ -408,7 +556,7 @@ static int _dns_client_process_quic_poll(struct dns_server_info *server_info)
 					continue;
 				}
 
-				int read_len = _dns_client_socket_ssl_recv_ext(server_info, poll_items[i].desc.value.ssl,
+				int read_len = _dns_client_quic_ssl_recv_ext(server_info, poll_items[i].desc.value.ssl,
 															   conn_stream->recv_buff.data, DNS_TCP_BUFFER);
 
 				if (read_len < 0) {
@@ -479,6 +627,47 @@ out:
 
 int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_event *event, unsigned long now)
 {
+	int ret = -1;
+
+	if (server_info->status == DNS_SERVER_STATUS_CONNECTING) {
+		/* do SSL handshake */
+		ret = _ssl_do_handshake(server_info);
+		if (ret <= 0) {
+			int ssl_ret = _ssl_get_error(server_info, ret);
+			if (_dns_client_ssl_poll_event(server_info, ssl_ret) == 0) {
+				return 0;
+			}
+
+			if (ssl_ret != SSL_ERROR_SYSCALL) {
+				unsigned long ssl_err = ERR_get_error();
+				tlog(TLOG_WARN, "QUIC handshake with %s failed, error: %s\n", server_info->ip,
+					 ERR_reason_error_string(ssl_err));
+				goto errout;
+			}
+
+			if (errno != ENETUNREACH) {
+				tlog(TLOG_WARN, "QUIC handshake with %s failed, %s", server_info->ip, strerror(errno));
+			}
+			goto errout;
+		}
+
+		tlog(TLOG_DEBUG, "QUIC server %s:%d connected\n", server_info->ip, server_info->port);
+
+		pthread_mutex_lock(&server_info->lock);
+		if (_dns_client_tls_verify(server_info) != 0) {
+			tlog(TLOG_WARN, "QUIC peer %s verify failed.", server_info->ip);
+			pthread_mutex_unlock(&server_info->lock);
+			goto errout;
+		}
+		pthread_mutex_unlock(&server_info->lock);
+
+		server_info->status = DNS_SERVER_STATUS_CONNECTED;
+		struct epoll_event mod_event = {0};
+		mod_event.events = EPOLLIN | EPOLLOUT;
+		mod_event.data.ptr = server_info;
+		epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &mod_event);
+	}
+
 	if (event->events & EPOLLIN) {
 		/* connection is closed, reconnect */
 		if (SSL_get_shutdown(server_info->ssl) != 0) {
@@ -524,9 +713,10 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 
 			SSL_set_ex_data(conn_stream->quic_stream, 0, conn_stream);
 
-			int send_len =
-				_dns_client_socket_ssl_send_ext(server_info, conn_stream->quic_stream, conn_stream->send_buff.data,
-												conn_stream->send_buff.len, SSL_WRITE_FLAG_CONCLUDE);
+			int send_len = _dns_client_quic_ssl_send_ext(server_info, conn_stream->quic_stream, 
+														conn_stream->send_buff.data, conn_stream->send_buff.len, 
+														SSL_WRITE_FLAG_CONCLUDE);
+
 			if (send_len < 0) {
 				if (errno == EAGAIN) {
 					epoll_events = EPOLLIN | EPOLLOUT;
@@ -559,6 +749,9 @@ int _dns_client_process_quic(struct dns_server_info *server_info, struct epoll_e
 	}
 	return 0;
 errout:
+	pthread_mutex_lock(&server_info->lock);
+	_dns_client_close_socket(server_info);
+	pthread_mutex_unlock(&server_info->lock);
 	return -1;
 }
 #endif
@@ -678,7 +871,7 @@ int _dns_client_send_quic_data(struct dns_query_struct *query, struct dns_server
 	SSL_set_ex_data(quic_stream, 0, stream);
 	stream->quic_stream = quic_stream;
 
-	send_len = _dns_client_socket_ssl_send_ext(server_info, quic_stream, packet, len, SSL_WRITE_FLAG_CONCLUDE);
+	send_len = _dns_client_quic_ssl_send_ext(server_info, quic_stream, packet, len, SSL_WRITE_FLAG_CONCLUDE);
 	if (send_len <= 0) {
 		if (errno == EAGAIN || errno == EPIPE || server_info->ssl == NULL) {
 			/* save data to buffer, and retry when EPOLLOUT is available */
