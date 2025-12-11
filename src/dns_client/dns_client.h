@@ -136,6 +136,14 @@ struct dns_server_info {
 	struct http2_ctx *http2_ctx;
 	char alpn_selected[32];
 
+	atomic_t conn_dead;
+	atomic_t conn_healthy;
+	atomic_t conn_error;
+	time_t last_fatal_error;
+	time_t last_io_error;
+	int consecutive_errors;
+	char last_error_str[256];
+
 	dns_server_security_status security_status;
 };
 
@@ -234,6 +242,7 @@ struct dns_conn_stream {
 		SSL *quic_stream;
 		struct http2_stream *http2_stream;
 	};
+	dns_server_type_t type;
 };
 
 /* query struct */
