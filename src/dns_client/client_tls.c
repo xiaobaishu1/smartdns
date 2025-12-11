@@ -536,6 +536,11 @@ int _dns_client_socket_ssl_send_ext(struct dns_server_info *server, SSL *ssl, co
 		return -1;
 	}
 
+	if (atomic_read(&server->conn_dead)) {
+		errno = ECONNRESET;
+		return -1;
+	}
+
 	ret = _ssl_write_ext2(server, ssl, buf, num, flags);
 	if (ret > 0) {
 		return ret;
@@ -559,19 +564,63 @@ int _dns_client_socket_ssl_send_ext(struct dns_server_info *server, SSL *ssl, co
 		char buff[256];
 		ssl_err = ERR_get_error();
 		int ssl_reason = ERR_GET_REASON(ssl_err);
-		if (ssl_reason == SSL_R_UNINITIALIZED || ssl_reason == SSL_R_PROTOCOL_IS_SHUTDOWN ||
-			ssl_reason == SSL_R_BAD_LENGTH || ssl_reason == SSL_R_SHUTDOWN_WHILE_IN_INIT ||
-			ssl_reason == SSL_R_BAD_WRITE_RETRY) {
+
+		switch (ssl_reason) {
+		case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+		case SSL_R_STREAM_FINISHED:
+			errno = EAGAIN;
+			return -1;
+		case SSL_R_UNINITIALIZED:
+		case SSL_R_PROTOCOL_IS_SHUTDOWN:
+		case SSL_R_BAD_LENGTH:
+		case SSL_R_SHUTDOWN_WHILE_IN_INIT:
+		case SSL_R_BAD_WRITE_RETRY:
+#ifdef SSL_R_READ_TIMEOUT
+		case SSL_R_READ_TIMEOUT:
+#endif
+#ifdef SSL_R_WRITE_TIMEOUT
+		case SSL_R_WRITE_TIMEOUT:
+#endif
+			errno = EAGAIN;
+			return -1;
+		default:
+			break;
+		}
+
+		tlog(TLOG_WARN, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		errno = EFAULT;
+		ret = -1;
+
+		server->consecutive_errors++;
+		if (server->consecutive_errors > 10) {
+			atomic_set(&server->conn_dead, 1);
+			server->last_fatal_error = time(NULL);
+			tlog(TLOG_ERROR, "Too many consecutive SSL write errors, marking connection dead");
+		}
+	} break;
+	case SSL_ERROR_SYSCALL:
+		if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+			tlog(TLOG_DEBUG, "SSL syscall fatal error: errno=%d", errno);
+			atomic_set(&server->conn_dead, 1);
+			atomic_set(&server->conn_error, errno);
+			server->last_fatal_error = time(NULL);
+			snprintf(server->last_error_str, sizeof(server->last_error_str),
+					"SSL_ERROR_SYSCALL: %s", strerror(errno));
+			return -1;
+		}
+		
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
 			errno = EAGAIN;
 			return -1;
 		}
 
-		tlog(TLOG_ERROR, "server %s SSL write fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
-		errno = EFAULT;
-		ret = -1;
-	} break;
-	case SSL_ERROR_SYSCALL:
 		tlog(TLOG_DEBUG, "SSL syscall failed, %s", strerror(errno));
+		server->consecutive_errors++;
+		if (server->consecutive_errors > 5) {
+			atomic_set(&server->conn_dead, 1);
+			server->last_fatal_error = time(NULL);
+		}
+		errno = EAGAIN;
 		return ret;
 	default:
 		errno = EFAULT;
@@ -630,20 +679,57 @@ int _dns_client_socket_ssl_recv_ext(struct dns_server_info *server, SSL *ssl, vo
 #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
 		case SSL_R_UNEXPECTED_EOF_WHILE_READING:
 #endif
-			return 0;
+			errno = EAGAIN;
+			return -1;
+		case SSL_R_BAD_LENGTH:
+		case SSL_R_BAD_WRITE_RETRY:
+#ifdef SSL_R_READ_TIMEOUT
+		case SSL_R_READ_TIMEOUT:
+#endif
+#ifdef SSL_R_WRITE_TIMEOUT
+		case SSL_R_WRITE_TIMEOUT:
+#endif
+			errno = EAGAIN;
+			return -1;
 		default:
 			break;
 		}
 
-		tlog(TLOG_ERROR, "server %s SSL read fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
+		tlog(TLOG_WARN, "server %s SSL read fail error: %s", server->ip, ERR_error_string(ssl_err, buff));
 		errno = EFAULT;
 		ret = -1;
+
+		server->consecutive_errors++;
+		if (server->consecutive_errors > 10) {
+			atomic_set(&server->conn_dead, 1);
+			server->last_fatal_error = time(NULL);
+			tlog(TLOG_ERROR, "Too many consecutive SSL read errors, marking connection dead");
+		}
 	} break;
 	case SSL_ERROR_SYSCALL:
 		if (errno == 0) {
 			return 0;
 		}
 
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+			errno = EAGAIN;
+			return -1;
+		}
+		
+		if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+			atomic_set(&server->conn_dead, 1);
+			atomic_set(&server->conn_error, errno);
+			server->last_fatal_error = time(NULL);
+			tlog(TLOG_DEBUG, "SSL syscall fatal error: errno=%d", errno);
+		} else {
+			server->consecutive_errors++;
+			if (server->consecutive_errors > 5) {
+				atomic_set(&server->conn_dead, 1);
+				server->last_fatal_error = time(NULL);
+			}
+			errno = EAGAIN;
+		}
+		
 		ret = -1;
 		return ret;
 	default:
@@ -1011,8 +1097,42 @@ int _dns_client_process_tls(struct dns_server_info *server_info, struct epoll_ev
 		if (ret <= 0) {
 			memset(&fd_event, 0, sizeof(fd_event));
 			ssl_ret = _ssl_get_error(server_info, ret);
-			if (_dns_client_ssl_poll_event(server_info, ssl_ret) == 0) {
-				return 0;
+
+			if (ssl_ret == SSL_ERROR_WANT_READ || ssl_ret == SSL_ERROR_WANT_WRITE) {
+				if (_dns_client_ssl_poll_event(server_info, ssl_ret) == 0) {
+					return 0;
+				}
+			} else if (ssl_ret == SSL_ERROR_SSL) {
+				unsigned long ssl_err = ERR_get_error();
+				int ssl_reason = ERR_GET_REASON(ssl_err);
+
+				switch (ssl_reason) {
+				case SSL_R_UNINITIALIZED:
+				case SSL_R_SHUTDOWN_WHILE_IN_INIT:
+				case SSL_R_PROTOCOL_IS_SHUTDOWN:
+#ifdef SSL_R_STREAM_FINISHED
+				case SSL_R_STREAM_FINISHED:
+#endif
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+				case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+#endif
+				case SSL_R_BAD_LENGTH:
+				case SSL_R_BAD_WRITE_RETRY:
+#ifdef SSL_R_READ_TIMEOUT
+				case SSL_R_READ_TIMEOUT:
+#endif
+#ifdef SSL_R_WRITE_TIMEOUT
+				case SSL_R_WRITE_TIMEOUT:
+#endif
+					if (_dns_client_ssl_poll_event(server_info, SSL_ERROR_WANT_READ) == 0) {
+						return 0;
+					}
+					break;
+				default:
+					tlog(TLOG_WARN, "Handshake with %s failed, error: %s\n", server_info->ip,
+						 ERR_reason_error_string(ssl_err));
+					goto errout;
+				}
 			}
 
 			if (ssl_ret != SSL_ERROR_SYSCALL) {
