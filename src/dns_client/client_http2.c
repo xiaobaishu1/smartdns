@@ -26,34 +26,172 @@
 
 #include "smartdns/http2.h"
 
+#include <errno.h>
+#include <openssl/ssl.h>
+#include <time.h>
 #include <string.h>
+
+static int _http2_connection_usable(struct dns_server_info *server_info)
+{
+	if (!server_info) return 0;
+
+	if (atomic_read(&server_info->conn_dead)) {
+		tlog(TLOG_DEBUG, "Connection marked as dead (errno=%ld)", 
+			(long)atomic_read(&server_info->conn_error));
+		return 0;
+	}
+
+	if (server_info->fd <= 0) {
+		tlog(TLOG_DEBUG, "Socket FD invalid");
+		atomic_set(&server_info->conn_dead, 1);
+		return 0;
+	}
+
+	if (server_info->ssl == NULL) {
+		tlog(TLOG_DEBUG, "SSL context is NULL");
+		atomic_set(&server_info->conn_dead, 1);
+		return 0;
+	}
+
+	if (server_info->status != DNS_SERVER_STATUS_CONNECTED) {
+		if (server_info->status == DNS_SERVER_STATUS_DISCONNECTED) {
+			atomic_set(&server_info->conn_dead, 1);
+		}
+		tlog(TLOG_DEBUG, "Server not connected, status=%d", server_info->status);
+		return 0;
+	}
+
+	if (server_info->consecutive_errors > 10) {
+		tlog(TLOG_DEBUG, "Too many consecutive errors (%d)", server_info->consecutive_errors);
+		atomic_set(&server_info->conn_dead, 1);
+		return 0;
+	}
+
+	if (server_info->last_fatal_error > 0) {
+		time_t now = time(NULL);
+		if (now - server_info->last_fatal_error < 10) {
+			tlog(TLOG_DEBUG, "Recent fatal error, connection unusable");
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+static inline int _http2_connection_dead(struct dns_server_info *server_info)
+{
+	return atomic_read(&server_info->conn_dead);
+}
 
 /* BIO read callback for HTTP/2 */
 static int _http2_bio_read(void *private_data, uint8_t *buf, int len)
 {
 	struct dns_server_info *server_info = (struct dns_server_info *)private_data;
-	return _dns_client_socket_ssl_recv(server_info, buf, len);
+
+	if (!server_info || server_info->fd <= 0 || !server_info->ssl) {
+		errno = ECONNRESET;
+		return -1;
+	}
+	
+	int r = _dns_client_socket_ssl_recv(server_info, buf, len);
+	if (r <= 0) {
+		if (server_info->ssl) {
+			int ssl_err = SSL_get_error(server_info->ssl, r);
+			if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+				errno = EAGAIN;
+				return -1;
+			}
+
+			if (ssl_err == SSL_ERROR_SYSCALL) {
+				if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+					server_info->last_io_error = time(NULL);
+				}
+			}
+		}
+		return -1;
+	}
+	server_info->consecutive_errors = 0;
+	
+	return r;
 }
 
 /* BIO write callback for HTTP/2 */
 static int _http2_bio_write(void *private_data, const uint8_t *buf, int len)
 {
 	struct dns_server_info *server_info = (struct dns_server_info *)private_data;
-	return _dns_client_socket_ssl_send(server_info, buf, len);
+
+	if (_http2_connection_dead(server_info)) {
+		errno = ECONNRESET;
+		return -1;
+	}
+	
+	int r = _dns_client_socket_ssl_send(server_info, buf, len);
+	if (r <= 0) {
+		/* Map SSL non-blocking WANTs to EAGAIN so HTTP2 layer will retry */
+		if (server_info && server_info->ssl) {
+			int ssl_err = SSL_get_error(server_info->ssl, r);
+			if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+				errno = EAGAIN;
+				return -1;
+			}
+
+			if (ssl_err == SSL_ERROR_SYSCALL) {
+				if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+					atomic_set(&server_info->conn_dead, 1);
+					atomic_set(&server_info->conn_error, errno);
+					server_info->last_fatal_error = time(NULL);
+					server_info->consecutive_errors++;
+					return -1;
+				}
+			}
+
+			if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
+				server_info->last_io_error = time(NULL);
+				server_info->consecutive_errors++;
+
+				if (server_info->consecutive_errors > 3) {
+					atomic_set(&server_info->conn_dead, 1);
+				}
+			}
+		}
+		
+		return -1;
+	}
+
+	server_info->consecutive_errors = 0;
+	
+	return r;
 }
 
-/* Helper function to send buffered data from a conn_stream via HTTP/2 */
-static int _dns_client_send_http2_stream(struct dns_server_info *server_info, struct dns_conn_stream *conn_stream,
-										 void *data, unsigned short len)
+static int _dns_client_send_http2_stream_safe(struct dns_server_info *server_info, 
+											  struct dns_conn_stream *conn_stream,
+											  void *data, unsigned short len)
 {
 	struct http2_ctx *http2_ctx = server_info->http2_ctx;
 	struct http2_stream *http2_stream = NULL;
 	struct client_dns_server_flag_https *https_flag = &server_info->flags.https;
 	char content_length[32];
 
+	if (!_http2_connection_usable(server_info)) {
+		tlog(TLOG_DEBUG, "Cannot send on unusable connection");
+		return -1;
+	}
+
+	if (http2_ctx == NULL) {
+		tlog(TLOG_ERROR, "HTTP/2 context is NULL");
+		return -1;
+	}
+
+	if (http2_ctx_is_closed(http2_ctx)) {
+		tlog(TLOG_DEBUG, "HTTP/2 context is closed");
+		atomic_set(&server_info->conn_dead, 1);
+		return -1;
+	}
+
 	/* Create HTTP/2 stream */
 	http2_stream = http2_stream_new(http2_ctx);
 	if (http2_stream == NULL) {
+		tlog(TLOG_ERROR, "Failed to create HTTP/2 stream");
 		return -1;
 	}
 
@@ -70,6 +208,7 @@ static int _dns_client_send_http2_stream(struct dns_server_info *server_info, st
 										  {NULL, NULL}};
 
 	if (http2_stream_set_request(http2_stream, "POST", https_flag->path, headers) < 0) {
+		tlog(TLOG_DEBUG, "http2_stream_set_request failed for path=%s", https_flag->path ? https_flag->path : "(null)");
 		pthread_mutex_lock(&server_info->lock);
 		conn_stream->http2_stream = NULL;
 		pthread_mutex_unlock(&server_info->lock);
@@ -77,8 +216,8 @@ static int _dns_client_send_http2_stream(struct dns_server_info *server_info, st
 		return -1;
 	}
 
-	/* Write request body */
-	if (http2_stream_write_body(http2_stream, (const uint8_t *)data, len, 1) < 0) {
+	if (_http2_connection_dead(server_info)) {
+		tlog(TLOG_DEBUG, "Connection died before writing body");
 		pthread_mutex_lock(&server_info->lock);
 		conn_stream->http2_stream = NULL;
 		pthread_mutex_unlock(&server_info->lock);
@@ -86,6 +225,139 @@ static int _dns_client_send_http2_stream(struct dns_server_info *server_info, st
 		return -1;
 	}
 
+	int ret = http2_stream_write_body(http2_stream, (const uint8_t *)data, len, 1);
+	if (ret < 0) {
+		if (errno == EAGAIN) {
+			/* put back http2_stream reference and clear association, keep buffer for retry */
+			pthread_mutex_lock(&server_info->lock);
+			conn_stream->http2_stream = NULL;
+			pthread_mutex_unlock(&server_info->lock);
+			http2_stream_put(http2_stream);
+
+			/* Ensure epoll monitors writable events so handshake/send will resume */
+			if (server_info->fd > 0) {
+				struct epoll_event event;
+				memset(&event, 0, sizeof(event));
+				event.events = EPOLLIN | EPOLLOUT;
+				event.data.ptr = server_info;
+				if (epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event) != 0) {
+					tlog(TLOG_DEBUG, "epoll ctl mod for WANT_WRITE failed, errno=%d", errno);
+				}
+			}
+			return -1;
+		}
+
+		if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+			atomic_set(&server_info->conn_dead, 1);
+			atomic_set(&server_info->conn_error, errno);
+			server_info->last_fatal_error = time(NULL);
+			tlog(TLOG_DEBUG, "Fatal error in HTTP/2 stream write: errno=%d", errno);
+
+			_dns_client_close_socket(server_info);
+		}
+
+		pthread_mutex_lock(&server_info->lock);
+		conn_stream->http2_stream = NULL;
+		pthread_mutex_unlock(&server_info->lock);
+		http2_stream_put(http2_stream);
+		return -1;
+	}
+
+	return 0;
+}
+
+/* Handshake helper: perform multi-round non-blocking handshake for http2 ctx.
+ * Returns 1 on complete, 0 if still in progress but polled (caller may retry later), <0 on error.
+ */
+static int _http2_handshake_loop(struct http2_ctx *http2_ctx, struct dns_server_info *server_info, int max_loops)
+{
+	struct http2_poll_item poll_items[4];
+	int poll_count = 0;
+	int loop = 0;
+
+	if (!http2_ctx) {
+		return -1;
+	}
+
+	if (server_info->fd <= 0 || !server_info->ssl) {
+		tlog(TLOG_DEBUG, "Connection not ready for handshake");
+		return -1;
+	}
+
+	server_info->consecutive_errors = 0;
+
+	while (loop++ < max_loops) {
+		int ret = http2_ctx_handshake(http2_ctx);
+		if (ret < 0) {
+			if (ret == HTTP2_ERR_IO) {
+				tlog(TLOG_DEBUG, "http2 handshake IO error in loop ret=%d, errno=%d", ret, errno);
+				server_info->consecutive_errors++;
+
+				if (server_info->consecutive_errors > 5) {
+					tlog(TLOG_ERROR, "Too many consecutive IO errors in handshake");
+					atomic_set(&server_info->conn_dead, 1);
+					return -1;
+				}
+
+				continue;
+			} else if (ret == HTTP2_ERR_EOF || ret == HTTP2_ERR_PROTOCOL) {
+				tlog(TLOG_ERROR, "http2 handshake fatal error ret=%d", ret);
+				atomic_set(&server_info->conn_dead, 1);
+				return -1;
+			} else {
+				tlog(TLOG_DEBUG, "http2 handshake temporary error ret=%d", ret);
+				server_info->consecutive_errors++;
+				if (server_info->consecutive_errors > 3) {
+					tlog(TLOG_WARN, "Too many temporary errors in handshake");
+					return -1;
+				}
+				continue;
+			}
+		} else if (ret == 1) {
+			/* Handshake complete */
+			server_info->consecutive_errors = 0;
+			return 1;
+		}
+
+		/* ret == 0 : handshake still in progress - poll some IO to drive it */
+		int pc = 0;
+		int pr = http2_ctx_poll(http2_ctx, poll_items, sizeof(poll_items) / sizeof(poll_items[0]), &pc);
+		if (pr < 0 && pr != HTTP2_ERR_EOF) {
+			tlog(TLOG_DEBUG, "http2 poll during handshake returned %d", pr);
+
+			if (pr == HTTP2_ERR_EOF || pr == HTTP2_ERR_PROTOCOL) {
+				atomic_set(&server_info->conn_dead, 1);
+				atomic_set(&server_info->conn_error, ECONNABORTED);
+				server_info->last_fatal_error = time(NULL);
+			}
+			
+			return -1;
+		}
+
+		if (atomic_read(&server_info->conn_dead)) {
+			tlog(TLOG_DEBUG, "Connection died during handshake");
+			return -1;
+		}
+
+		/* If http2 needs write, ensure EPOLLOUT is registered */
+		if (http2_ctx_want_write(http2_ctx) && server_info && server_info->fd > 0) {
+			struct epoll_event event;
+			memset(&event, 0, sizeof(event));
+			event.events = EPOLLIN | EPOLLOUT;
+			event.data.ptr = server_info;
+			if (epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event) != 0) {
+				/* Not fatal; just log */
+				tlog(TLOG_DEBUG, "epoll mod during handshake failed errno=%d", errno);
+			}
+		}
+
+		/* small sleep to avoid busy loop */
+		struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000 * 100};
+		nanosleep(&ts, NULL);
+	}
+
+	/* timed out trying to complete handshake - caller may retry later */
+	tlog(TLOG_DEBUG, "HTTP/2 handshake timeout after %d loops", max_loops);
 	return 0;
 }
 
@@ -149,6 +421,11 @@ static void _dns_client_send_buffered_http2_requests(struct dns_server_info *ser
 	struct dns_conn_stream *conn_stream = NULL;
 	struct dns_conn_stream *tmp = NULL;
 
+	if (_http2_connection_dead(server_info)) {
+		tlog(TLOG_DEBUG, "Connection dead, skipping buffered requests");
+		return;
+	}
+
 	while (1) {
 		struct dns_conn_stream *target_stream = NULL;
 
@@ -168,13 +445,19 @@ static void _dns_client_send_buffered_http2_requests(struct dns_server_info *ser
 			break;
 		}
 
-		/* Send buffered request using helper function */
-		if (_dns_client_send_http2_stream(server_info, target_stream, target_stream->send_buff.data,
-										  target_stream->send_buff.len) == 0) {
-			/* Clear buffer as it's now in HTTP/2 stream buffer */
+		if (_http2_connection_dead(server_info)) {
+			_dns_client_conn_stream_put(target_stream);
+			break;
+		}
+
+		if (_dns_client_send_http2_stream_safe(server_info, target_stream, 
+											  target_stream->send_buff.data, 
+											  target_stream->send_buff.len) == 0) {
 			target_stream->send_buff.len = 0;
 		} else {
-			_dns_client_release_stream_on_error(server_info, target_stream);
+			if (errno != EAGAIN) {
+				_dns_client_release_stream_on_error(server_info, target_stream);
+			}
 		}
 
 		_dns_client_conn_stream_put(target_stream);
@@ -190,12 +473,24 @@ int _dns_client_send_http2(struct dns_server_info *server_info, struct dns_query
 	struct client_dns_server_flag_https *https_flag = NULL;
 	int ret = -1;
 
+	if (_http2_connection_dead(server_info)) {
+		tlog(TLOG_DEBUG, "Connection is dead, aborting send");
+		return -1;
+	}
+
+	if (server_info->status == DNS_SERVER_STATUS_CONNECTED && 
+		!_http2_connection_usable(server_info)) {
+		tlog(TLOG_DEBUG, "Cannot send on unusable connection");
+		return -1;
+	}
+
 	/* Create connection stream for this request */
 	stream = _dns_client_conn_stream_new();
 	if (stream == NULL) {
 		tlog(TLOG_ERROR, "malloc memory failed for http2 stream.");
 		return -1;
 	}
+	stream->type = DNS_SERVER_HTTPS;
 
 	/* Link stream to server and query */
 	pthread_mutex_lock(&server_info->lock);
@@ -247,28 +542,65 @@ int _dns_client_send_http2(struct dns_server_info *server_info, struct dns_query
 	https_flag = &server_info->flags.https;
 
 	/* Initialize HTTP/2 context if not already done */
+	pthread_mutex_lock(&server_info->lock);
 	if (server_info->http2_ctx == NULL) {
 		http2_ctx = http2_ctx_client_new(https_flag->httphost, _http2_bio_read, _http2_bio_write, server_info, NULL);
 		if (http2_ctx == NULL) {
+			pthread_mutex_unlock(&server_info->lock);
 			tlog(TLOG_ERROR, "init http2 context failed.");
 			goto errout;
 		}
 		server_info->http2_ctx = http2_ctx;
+		/* Add reference for local use */
+		http2_ctx_ref(http2_ctx);
+		pthread_mutex_unlock(&server_info->lock);
 
-		/* Perform HTTP/2 handshake */
-		ret = http2_ctx_handshake(http2_ctx);
+		/* Perform multi-round non-blocking handshake */
+		ret = _http2_handshake_loop(http2_ctx, server_info, 50);
 		if (ret < 0) {
-			tlog(TLOG_ERROR, "http2 handshake failed.");
+			tlog(TLOG_ERROR, "http2 handshake failed (fatal).");
 			goto errout;
+		} else if (ret == 0) {
+			/* handshake still in progress - keep the packet in buffer and schedule EPOLLOUT */
+			if (DNS_TCP_BUFFER - stream->send_buff.len < len) {
+				tlog(TLOG_ERROR, "send buffer is full.");
+				goto errout;
+			}
+			memcpy(stream->send_buff.data + stream->send_buff.len, packet, len);
+			stream->send_buff.len += len;
+
+			if (server_info->fd > 0) {
+				struct epoll_event event;
+				memset(&event, 0, sizeof(event));
+				event.events = EPOLLIN | EPOLLOUT;
+				event.data.ptr = server_info;
+				epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event);
+			}
+
+			_dns_client_conn_stream_put(stream);
+			http2_ctx_unref(http2_ctx);
+			return 0;
 		}
 	} else {
 		http2_ctx = server_info->http2_ctx;
+		http2_ctx_ref(http2_ctx);
+		pthread_mutex_unlock(&server_info->lock);
+	}
+
+	if (_http2_connection_dead(server_info)) {
+		tlog(TLOG_DEBUG, "Connection became dead before send");
+		goto errout;
 	}
 
 	/* Send the request via HTTP/2 */
-	ret = _dns_client_send_http2_stream(server_info, stream, packet, len);
+	ret = _dns_client_send_http2_stream_safe(server_info, stream, packet, len);
 	if (ret < 0) {
-		tlog(TLOG_ERROR, "send http2 stream failed.");
+		if (errno == EPIPE || errno == ECONNRESET || errno == ECONNABORTED) {
+			tlog(TLOG_DEBUG, "Fatal error in HTTP/2 send, closing connection");
+			_dns_client_close_socket(server_info);
+		} else {
+			tlog(TLOG_ERROR, "send http2 stream failed, errno=%d", errno);
+		}
 		goto errout;
 	}
 
@@ -296,6 +628,7 @@ int _dns_client_send_http2(struct dns_server_info *server_info, struct dns_query
 
 	/* Release initial reference - stream is now managed by the lists */
 	_dns_client_conn_stream_put(stream);
+	http2_ctx_unref(http2_ctx);
 	return 0;
 
 errout:
@@ -305,8 +638,8 @@ errout:
 	if (http2_stream) {
 		http2_stream_put(http2_stream);
 	}
-	if (http2_ctx && server_info->http2_ctx == NULL) {
-		http2_ctx_free(http2_ctx);
+	if (http2_ctx) {
+		http2_ctx_unref(http2_ctx);
 	}
 	return -1;
 }
@@ -315,6 +648,12 @@ int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_
 {
 	struct http2_ctx *http2_ctx = server_info->http2_ctx;
 	int ret = 0;
+
+	if (_http2_connection_dead(server_info)) {
+		tlog(TLOG_DEBUG, "Processing HTTP/2 on dead connection, closing");
+		_dns_client_close_socket(server_info);
+		return -1;
+	}
 
 	/* Initialize context if needed (e.g. first time in EPOLLOUT) */
 	if (http2_ctx == NULL) {
@@ -329,6 +668,11 @@ int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_
 
 	/* Handle EPOLLOUT - flush pending writes and send buffered requests */
 	if (event->events & EPOLLOUT) {
+		if (_http2_connection_dead(server_info)) {
+			tlog(TLOG_DEBUG, "Connection dead during EPOLLOUT");
+			goto errout;
+		}
+
 		/* Send buffered requests */
 		_dns_client_send_buffered_http2_requests(server_info);
 
@@ -355,6 +699,11 @@ int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_
 
 	/* Handle EPOLLIN - read and process data */
 	if (event->events & EPOLLIN) {
+		if (_http2_connection_dead(server_info)) {
+			tlog(TLOG_DEBUG, "Connection dead during EPOLLIN");
+			goto errout;
+		}
+
 		struct http2_poll_item poll_items[10];
 		int poll_count = 0;
 		uint8_t response_body[DNS_IN_PACKSIZE];
@@ -363,23 +712,34 @@ int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_
 		const int MAX_LOOP_COUNT = 128;
 
 		/* Ensure handshake is complete before polling */
-		ret = http2_ctx_handshake(http2_ctx);
-		if (ret == 0) {
-			/* Handshake in progress, need more data */
-			return 0;
-		} else if (ret < 0) {
-			tlog(TLOG_ERROR, "http2 handshake failed.");
+		ret = _http2_handshake_loop(http2_ctx, server_info, 50);
+		if (ret < 0) {
+			tlog(TLOG_ERROR, "http2 handshake failed during process.");
 			goto errout;
+		} else if (ret == 0) {
+			/* handshake still in progress - wait for more events */
+			return 0;
 		}
 		/* ret == 1 means handshake complete, continue */
 
 		/* Poll and process streams until no more ready */
 		while (loop_count++ < MAX_LOOP_COUNT) {
+			if (_http2_connection_dead(server_info)) {
+				tlog(TLOG_DEBUG, "Connection died during processing");
+				goto errout;
+			}
+
 			/* Poll for stream readiness */
 			ret = http2_ctx_poll(http2_ctx, poll_items, 10, &poll_count);
 			if (ret < 0) {
 				if (ret != HTTP2_ERR_EOF) {
 					tlog(TLOG_DEBUG, "http2 poll failed, ret=%d", ret);
+
+					if (ret == HTTP2_ERR_EOF || ret == HTTP2_ERR_PROTOCOL) {
+						atomic_set(&server_info->conn_dead, 1);
+						atomic_set(&server_info->conn_error, ECONNABORTED);
+						server_info->last_fatal_error = time(NULL);
+					}
 				}
 				goto errout;
 			}
@@ -451,5 +811,7 @@ int _dns_client_process_http2(struct dns_server_info *server_info, struct epoll_
 
 	return 0;
 errout:
+	atomic_set(&server_info->conn_dead, 1);
+	_dns_client_close_socket(server_info);
 	return -1;
 }
