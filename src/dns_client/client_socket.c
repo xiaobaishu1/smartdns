@@ -39,6 +39,14 @@ int _dns_client_create_socket(struct dns_server_info *server_info)
 		return -1;
 	}
 
+	atomic_set(&server_info->conn_dead, 0);
+	atomic_set(&server_info->conn_healthy, 1);
+	atomic_set(&server_info->conn_error, 0);
+	server_info->consecutive_errors = 0;
+	server_info->last_fatal_error = 0;
+	server_info->last_io_error = 0;
+	memset(server_info->last_error_str, 0, sizeof(server_info->last_error_str));
+
 	time(&server_info->last_send);
 	time(&server_info->last_recv);
 
@@ -92,6 +100,9 @@ void _dns_client_close_socket_ext(struct dns_server_info *server_info, int no_de
 	pthread_mutex_lock(&server_info->lock);
 	server_status = server_info->status;
 	server_info->status = DNS_SERVER_STATUS_DISCONNECTED;
+
+	atomic_set(&server_info->conn_dead, 1);
+	atomic_set(&server_info->conn_healthy, 0);
 
 	/* remove fd from epoll */
 	if (server_info->fd > 0) {
@@ -194,6 +205,9 @@ void _dns_client_shutdown_socket(struct dns_server_info *server_info)
 		return;
 	}
 
+	atomic_set(&server_info->conn_dead, 1);
+	atomic_set(&server_info->conn_healthy, 0);
+
 	switch (server_info->type) {
 	case DNS_SERVER_UDP:
 		server_info->status = DNS_SERVER_STATUS_CONNECTING;
@@ -227,6 +241,11 @@ void _dns_client_shutdown_socket(struct dns_server_info *server_info)
 
 int _dns_client_socket_send(struct dns_server_info *server_info)
 {
+	if (atomic_read(&server_info->conn_dead)) {
+		errno = ECONNRESET;
+		return -1;
+	}
+
 	if (server_info->type == DNS_SERVER_UDP) {
 		return -1;
 	} else if (server_info->type == DNS_SERVER_TCP) {
@@ -257,6 +276,11 @@ int _dns_client_socket_send(struct dns_server_info *server_info)
 
 int _dns_client_socket_recv(struct dns_server_info *server_info)
 {
+	if (atomic_read(&server_info->conn_dead)) {
+		errno = ECONNRESET;
+		return -1;
+	}
+
 	if (server_info->type == DNS_SERVER_UDP) {
 		return -1;
 	} else if (server_info->type == DNS_SERVER_TCP) {
@@ -315,8 +339,8 @@ int _dns_client_send_data_to_buffer(struct dns_server_info *server_info, void *p
 	event.events = EPOLLIN | EPOLLOUT;
 	event.data.ptr = server_info;
 	if (epoll_ctl(client.epoll_fd, EPOLL_CTL_MOD, server_info->fd, &event) != 0) {
-		if (errno == ENOENT) {
-			/* fd not found, ignore */
+		if (errno == ENOENT || errno == EBADF) {
+			/* fd already closed or not in epoll, ignore */
 			return 0;
 		}
 		tlog(TLOG_ERROR, "epoll ctl failed, %s", strerror(errno));
