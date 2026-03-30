@@ -698,7 +698,7 @@ fn test_rest_api_cache_domains() {
     let res = client.login("admin", "password");
     assert!(res.is_ok());
 
-    let mut client_no_auth = common::TestClient::new(&server.get_host());
+    let client_no_auth = common::TestClient::new(&server.get_host());
     let c = client_no_auth.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, _) = c.unwrap();
