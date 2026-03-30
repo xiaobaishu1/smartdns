@@ -688,4 +688,34 @@ fn test_rest_api_server_status() {
     assert!(exists);
 }
 
+#[test]
+fn test_rest_api_cache_domains() {
+    let mut server = common::TestServer::new();
+    server.set_log_level(LogLevel::DEBUG);
+    assert!(server.start().is_ok());
 
+    let mut client = common::TestClient::new(&server.get_host());
+    let res = client.login("admin", "password");
+    assert!(res.is_ok());
+
+    // 未登录应返回 401
+    let client_no_auth = common::TestClient::new(&server.get_host());
+    let c = client_no_auth.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, _) = c.unwrap();
+    assert_eq!(code, 401);
+
+    // 登录后正常访问
+    let c = client.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, body) = c.unwrap();
+    assert_eq!(code, 200);
+
+    // 验证 JSON 结构包含 domains 字段
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.is_object());
+    assert!(
+        v.get("domains").is_some(),
+        "Response should contain 'domains' field"
+    );
+}
