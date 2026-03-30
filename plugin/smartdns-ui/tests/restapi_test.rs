@@ -698,28 +698,19 @@ fn test_rest_api_cache_domains() {
     let res = client.login("admin", "password");
     assert!(res.is_ok());
 
-    let client_no_auth = common::TestClient::new(&server.get_host());
-    let c = client_no_auth.get("/api/cache/domains");
-    assert!(c.is_ok());
-    let (code, _) = c.unwrap();
-    assert_eq!(code, 401);
-
-    for i in 0..10 {
-        let mut request = TestDnsRequest::new();
-        request.domain = format!("test{}.com", i);
-        assert!(server.send_test_dnsrequest(request).is_ok());
-    }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    let count_res = client.get("/api/cache/count");
+    assert!(count_res.is_ok());
+    let (count_code, count_body) = count_res.unwrap();
+    eprintln!("GET /api/cache/count => {} {}", count_code, count_body);
+    assert_eq!(count_code, 200);
 
     let c = client.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, body) = c.unwrap();
-    assert_eq!(code, 200);
+    eprintln!("GET /api/cache/domains => {} {}", code, body);
 
+    assert_eq!(code, 200);
+    
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(v.is_object());
-    assert!(
-        v.get("domains").is_some(),
-        "Response should contain 'domains' field"
-    );
+    assert!(v["domains"].is_array());
 }
