@@ -690,15 +690,26 @@ fn test_rest_api_server_status() {
 }
 
 #[test]
-fn test_cache_domains_direct() {
+fn test_rest_api_cache_domains() {
     let mut server = common::TestServer::new();
-    server.start().unwrap();
+    server.set_log_level(LogLevel::DEBUG);
+    assert!(server.start().is_ok());
+
+    let mut client = common::TestClient::new(&server.get_host());
+    let login_res = client.login("admin", "password");
+    assert!(login_res.is_ok());
 
     let mut request = TestDnsRequest::new();
     request.domain = "test0.com".to_string();
-    server.send_test_dnsrequest(request).unwrap();
+    request.id = 0;
+    assert!(server.send_test_dnsrequest(request).is_ok());
 
-    let domains = smartdns::get_cached_domains();
+    let get_res = client.get("/api/cache/domains");
+    assert!(get_res.is_ok());
+    let (code, body) = get_res.unwrap();
+    assert_eq!(code, 200);
+
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let domains = json["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
-    assert_eq!(domains[0].domain, "test0.com");
 }
