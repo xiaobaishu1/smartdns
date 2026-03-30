@@ -22,7 +22,6 @@ use common::TestDnsRequest;
 use nix::libc::c_char;
 use smartdns_ui::{http_api_msg, http_jwt::JwtClaims, smartdns::LogLevel};
 use std::ffi::CString;
-use smartdns_ui::smartdns::smartdns_c;
 
 #[test]
 fn test_rest_api_login() {
@@ -695,10 +694,6 @@ fn test_rest_api_cache_domains() {
     server.set_log_level(LogLevel::DEBUG);
     assert!(server.start().is_ok());
 
-    unsafe {
-        let _ = smartdns_c::dns_cache_init(1024, 0, None);
-    }
-
     let mut client = common::TestClient::new(&server.get_host());
     let login_res = client.login("admin", "password");
     assert!(login_res.is_ok());
@@ -709,7 +704,6 @@ fn test_rest_api_cache_domains() {
         request.id = i as u16;
         assert!(server.send_test_dnsrequest(request).is_ok());
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
 
     let get_res = client.get("/api/cache/domains");
     assert!(get_res.is_ok());
