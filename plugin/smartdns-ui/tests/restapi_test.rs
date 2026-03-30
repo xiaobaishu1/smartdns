@@ -698,21 +698,25 @@ fn test_rest_api_cache_domains() {
     let res = client.login("admin", "password");
     assert!(res.is_ok());
 
+    // 未登录时应返回 401
     let client_no_auth = common::TestClient::new(&server.get_host());
     let c = client_no_auth.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, _) = c.unwrap();
     assert_eq!(code, 401);
 
+    // 登录后正常访问
     let c = client.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, body) = c.unwrap();
     assert_eq!(code, 200);
 
+    // 解析 JSON 并验证结构
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(v.is_object());
     let domains = v.get("domains").expect("Missing domains field").as_array().unwrap();
 
+    // 检查每个缓存条目的字段是否存在（若列表非空）
     for domain in domains {
         assert!(domain.get("id").is_some());
         assert!(domain.get("domain").is_some());
