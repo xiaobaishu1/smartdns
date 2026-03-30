@@ -688,6 +688,7 @@ fn test_rest_api_server_status() {
     assert!(exists);
 }
 
+
 #[test]
 fn test_rest_api_cache_domains() {
     let mut server = common::TestServer::new();
