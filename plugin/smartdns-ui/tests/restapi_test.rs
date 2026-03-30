@@ -696,9 +696,7 @@ fn test_rest_api_cache_domains() {
     assert!(server.start().is_ok());
 
     unsafe {
-        if smartdns_c::dns_cache_total_num() == 0 {
-            smartdns_c::dns_cache_init(1024, 0, None);
-        }
+        let _ = smartdns_c::dns_cache_init(1024, 0, None);
     }
 
     let mut client = common::TestClient::new(&server.get_host());
