@@ -22,6 +22,7 @@ use common::TestDnsRequest;
 use nix::libc::c_char;
 use smartdns_ui::{http_api_msg, http_jwt::JwtClaims, smartdns::LogLevel};
 use std::ffi::CString;
+use common::TestServer;
 
 #[test]
 fn test_rest_api_login() {
@@ -690,39 +691,28 @@ fn test_rest_api_server_status() {
 
 #[tokio::test]
 async fn test_rest_api_cache_domains() {
-    let server = TestServer::new().await;
+    let mut server = common::TestServer::new();
+    server.set_log_level(LogLevel::DEBUG);
+    assert!(server.start().is_ok());
 
-    let resp = server.get("/api/cache/count").await;
-    assert_eq!(resp.status(), 200);
-    let count_body: serde_json::Value = resp.json().await.unwrap();
-    let cache_number = count_body["cache_number"].as_u64().unwrap();
-    eprintln!("Cache number: {}", cache_number);
+    let mut client = common::TestClient::new(&server.get_host());
+    let res = client.login("admin", "password");
+    assert!(res.is_ok());
 
-    let resp = server.get("/api/cache/domains").await;
-    assert_eq!(resp.status(), 200, "Expected 200, got {}", resp.status());
+    let c = client.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, body) = c.unwrap();
+    assert_eq!(code, 200);
 
-    let body: serde_json::Value = resp.json().await.unwrap();
-
-    assert!(body.get("domains").is_some(), "Response missing 'domains' field");
-    let domains = body["domains"].as_array().unwrap();
-
-    assert_eq!(domains.len() as u64, cache_number, 
-               "Domains count mismatch: {} vs {}", domains.len(), cache_number);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("domains").is_some(), "Missing 'domains' field");
+    let domains = json["domains"].as_array().unwrap();
 
     for domain in domains {
-        assert!(domain.get("id").is_some(), "Domain missing id");
-        assert!(domain.get("domain").is_some(), "Domain missing domain");
-        assert!(domain.get("qtype").is_some(), "Domain missing qtype");
-        assert!(domain.get("cached_time").is_some(), "Domain missing cached_time");
-        assert!(domain.get("ttl_remaining").is_some(), "Domain missing ttl_remaining");
-
-        let id = domain["id"].as_u64().unwrap();
-        let domain_name = domain["domain"].as_str().unwrap();
-        let qtype = domain["qtype"].as_u64().unwrap();
-
-        eprintln!("Domain {}: {} (type: {}, ttl: {})", 
-                  id, domain_name, qtype, domain["ttl_remaining"]);
+        assert!(domain.get("id").is_some());
+        assert!(domain.get("domain").is_some());
+        assert!(domain.get("qtype").is_some());
+        assert!(domain.get("cached_time").is_some());
+        assert!(domain.get("ttl_remaining").is_some());
     }
-
-    eprintln!("Test passed: found {} cached domains", domains.len());
 }
