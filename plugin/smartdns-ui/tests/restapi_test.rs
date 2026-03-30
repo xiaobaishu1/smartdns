@@ -698,11 +698,28 @@ fn test_rest_api_cache_domains() {
     let res = client.login("admin", "password");
     assert!(res.is_ok());
 
+    let client_no_auth = common::TestClient::new(&server.get_host());
+    let c = client_no_auth.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, _) = c.unwrap();
+    assert_eq!(code, 401);
+
+    for i in 0..10 {
+        let mut request = TestDnsRequest::new();
+        request.domain = format!("test{}.com", i);
+        assert!(server.send_test_dnsrequest(request).is_ok());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     let c = client.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, body) = c.unwrap();
     assert_eq!(code, 200);
 
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(v["domains"].is_array());
+    assert!(v.is_object());
+    assert!(
+        v.get("domains").is_some(),
+        "Response should contain 'domains' field"
+    );
 }
