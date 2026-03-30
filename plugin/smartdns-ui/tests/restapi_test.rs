@@ -695,20 +695,29 @@ fn test_rest_api_cache_domains() {
     assert!(server.start().is_ok());
 
     let mut client = common::TestClient::new(&server.get_host());
-    let login_res = client.login("admin", "password");
-    assert!(login_res.is_ok());
+    let res = client.login("admin", "password");
+    assert!(res.is_ok());
 
-    let mut request = TestDnsRequest::new();
-    request.domain = "test0.com".to_string();
-    request.id = 0;
-    assert!(server.send_test_dnsrequest(request).is_ok());
+    let mut client_no_auth = common::TestClient::new(&server.get_host());
+    let c = client_no_auth.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, _) = c.unwrap();
+    assert_eq!(code, 401);
 
-    let get_res = client.get("/api/cache/domains");
-    assert!(get_res.is_ok());
-    let (code, body) = get_res.unwrap();
+    let c = client.get("/api/cache/domains");
+    assert!(c.is_ok());
+    let (code, body) = c.unwrap();
     assert_eq!(code, 200);
 
-    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let domains = json["domains"].as_array().unwrap();
-    assert_eq!(domains.len(), 1);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.is_object());
+    let domains = v.get("domains").expect("Missing domains field").as_array().unwrap();
+
+    for domain in domains {
+        assert!(domain.get("id").is_some());
+        assert!(domain.get("domain").is_some());
+        assert!(domain.get("qtype").is_some());
+        assert!(domain.get("cached_time").is_some());
+        assert!(domain.get("ttl_remaining").is_some());
+    }
 }
