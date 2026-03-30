@@ -694,6 +694,12 @@ fn test_rest_api_cache_domains() {
     server.set_log_level(LogLevel::DEBUG);
     assert!(server.start().is_ok());
 
+    unsafe {
+        if smartdns_c::dns_cache_total_num() == 0 {
+            smartdns_c::dns_cache_init(1024, 0, None);
+        }
+    }
+
     let mut client = common::TestClient::new(&server.get_host());
     let login_res = client.login("admin", "password");
     assert!(login_res.is_ok());
@@ -704,6 +710,7 @@ fn test_rest_api_cache_domains() {
         request.id = i as u16;
         assert!(server.send_test_dnsrequest(request).is_ok());
     }
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     let get_res = client.get("/api/cache/domains");
     assert!(get_res.is_ok());
