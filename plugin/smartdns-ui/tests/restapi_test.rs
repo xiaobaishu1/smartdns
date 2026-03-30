@@ -22,7 +22,6 @@ use common::TestDnsRequest;
 use nix::libc::c_char;
 use smartdns_ui::{http_api_msg, http_jwt::JwtClaims, smartdns::LogLevel};
 use std::ffi::CString;
-use smartdns_ui::smartdns;
 
 #[test]
 fn test_rest_api_login() {
