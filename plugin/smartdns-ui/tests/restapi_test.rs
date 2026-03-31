@@ -22,7 +22,6 @@ use common::TestDnsRequest;
 use nix::libc::c_char;
 use smartdns_ui::{http_api_msg, http_jwt::JwtClaims, smartdns::LogLevel};
 use std::ffi::CString;
-use common::TestServer;
 
 #[test]
 fn test_rest_api_login() {
@@ -689,8 +688,8 @@ fn test_rest_api_server_status() {
     assert!(exists);
 }
 
-#[tokio::test]
-async fn test_rest_api_cache_domains() {
+#[test]
+fn test_rest_api_cache_domains() {
     let mut server = common::TestServer::new();
     server.set_log_level(LogLevel::DEBUG);
     assert!(server.start().is_ok());
@@ -702,10 +701,10 @@ async fn test_rest_api_cache_domains() {
     let c = client.get("/api/cache/domains");
     assert!(c.is_ok());
     let (code, body) = c.unwrap();
-    assert_eq!(code, 200);
+    assert_eq!(code, 200, "Expected 200 OK, got {}", code);
 
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(json.get("domains").is_some(), "Missing 'domains' field");
+    assert!(json.get("domains").is_some(), "Response missing 'domains' field");
     let domains = json["domains"].as_array().unwrap();
 
     for domain in domains {
