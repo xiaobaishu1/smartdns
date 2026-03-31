@@ -107,7 +107,6 @@ impl API {
         api.register(Method::PUT, "/api/stats/refresh", true, APIRoute!(API::api_stats_refresh));
         api.register(Method::GET, "/api/whois", true, APIRoute!(API::api_whois));
         api.register(Method::GET, "/api/tool/term", true, APIRoute!(API::api_tool_term));
-        api.register(Method::GET, "/api/stats/top/domain_blocked", true, APIRoute!(API::api_stats_get_top_domain_blocked));
         api
     }
 
