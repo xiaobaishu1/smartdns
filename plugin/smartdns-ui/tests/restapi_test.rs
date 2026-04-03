@@ -489,7 +489,7 @@ fn test_rest_api_devices() {
     let devices: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
     assert!(!devices.is_empty());
 
-    for device in devices {
+    for device in &devices {
         assert!(device.get("id").is_some());
         assert!(device.get("mac").is_some());
         assert!(device.get("hostname").is_some());
