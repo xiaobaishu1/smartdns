@@ -745,6 +745,21 @@ impl API {
         API::response_build(StatusCode::OK, body)
     }
 
+    async fn api_devices_get_list(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let data_server = this.get_data_server();
+        let devices = Self::get_devices_from_luci(&data_server).await?;
+        let body = serde_json::to_string(&devices)
+            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut response = Response::new(Full::new(Bytes::from(body)));
+        response.headers_mut().insert("Content-Type", "application/json".parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+        Ok(response)
+    }
+
     async fn get_devices_from_luci(data_server: &Arc<DataServer>) -> Result<Vec<DeviceInfo>, HttpError> {
         let output = tokio::task::spawn_blocking(|| {
             Command::new("ubus")
