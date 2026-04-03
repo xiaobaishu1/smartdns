@@ -18,6 +18,7 @@
 
 use crate::db::*;
 use crate::dns_log;
+use crate::data_server::DataServer;
 use crate::http_api_msg::*;
 use crate::http_error::*;
 use crate::http_jwt::*;
@@ -36,7 +37,10 @@ use matchit::Router;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
+use serde::Serialize;
+use serde_json::Value;
 use url::form_urlencoded;
 
 const PASSWORD_CONFIG_KEY: &str = "smartdns-ui.password";
@@ -49,6 +53,16 @@ type APIRouterFun = fn(
     req: Request<body::Incoming>,
 ) -> APIRouteFuture<'static, Result<Response<Full<Bytes>>, HttpError>>;
 type APIRouteParam = HashMap<String, String>;
+
+#[derive(Serialize)]
+struct DeviceInfo {
+    id: u64,
+    mac: String,
+    hostname: String,
+    ipv4_list: Vec<String>,
+    ipv6_list: Vec<String>,
+    last_query_timestamp: u64,
+}
 
 pub struct APIRouter {
     pub method: Method,
@@ -88,8 +102,7 @@ impl API {
         api.register(Method::GET, "/api/domain/count",  true, APIRoute!(API::api_domain_get_list_count));
         api.register(Method::GET, "/api/domain/{id}",  true, APIRoute!(API::api_domain_get_by_id));
         api.register(Method::DELETE, "/api/domain/{id}",  true, APIRoute!(API::api_domain_delete_by_id));
-        api.register(Method::GET, "/api/client", true, APIRoute!(API::api_client_get_list));
-        api.register(Method::DELETE, "/api/client/{id}",  true, APIRoute!(API::api_client_delete_by_id));
+        api.register(Method::DELETE, "/api/client/mac/{mac}", true, APIRoute!(API::api_client_delete_by_mac));
         api.register(Method::GET, "/api/log/stream", true, APIRoute!(API::api_log_stream));
         api.register(Method::PUT, "/api/log/level", true, APIRoute!(API::api_log_set_level));
         api.register(Method::GET, "/api/log/level", true, APIRoute!(API::api_log_get_level));
@@ -105,6 +118,7 @@ impl API {
         api.register(Method::GET, "/api/stats/hourly-query-count", true, APIRoute!(API::api_stats_get_hourly_query_count));
         api.register(Method::GET, "/api/stats/daily-query-count", true, APIRoute!(API::api_stats_get_daily_query_count));
         api.register(Method::PUT, "/api/stats/refresh", true, APIRoute!(API::api_stats_refresh));
+        api.register(Method::GET, "/api/devices", true, APIRoute!(API::api_devices_get_list));
         api.register(Method::GET, "/api/whois", true, APIRoute!(API::api_whois));
         api.register(Method::GET, "/api/tool/term", true, APIRoute!(API::api_tool_term));
         api
@@ -534,34 +548,23 @@ impl API {
         API::response_build(StatusCode::OK, body)
     }
 
-    /// Delete the client by id <br>
-    /// API: DELETE /api/client/{id}
-    ///  parameter: <br>
-    async fn api_client_delete_by_id(
+    /// Delete the client by mac <br>
+    /// API: DELETE /api/client/mac/{mac}
+    async fn api_client_delete_by_mac(
         this: Arc<HttpServer>,
         param: APIRouteParam,
         _req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
-        let id = match API::params_parser_value(param.get("id")) {
-            Some(v) => v,
-            None => return API::response_error(StatusCode::BAD_REQUEST, "Invalid parameter."),
+        let mac = match param.get("mac") {
+            Some(m) => m,
+            None => return API::response_error(StatusCode::BAD_REQUEST, "Missing mac parameter"),
         };
-
         let data_server = this.get_data_server();
-        let ret = match data_server.delete_client_by_id(id) {
-            Ok(v) => v,
-            Err(e) => {
-                return API::response_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    e.to_string().as_str(),
-                )
-            }
-        };
-
-        if ret == 0 {
-            return API::response_error(StatusCode::NOT_FOUND, "Not found");
+        let deleted = data_server.delete_client_by_mac(mac)
+            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if deleted == 0 {
+            return API::response_error(StatusCode::NOT_FOUND, "No client found for this MAC");
         }
-
         API::response_build(StatusCode::NO_CONTENT, "".to_string())
     }
 
@@ -741,98 +744,67 @@ impl API {
         API::response_build(StatusCode::OK, body)
     }
 
-    async fn api_client_get_list(
+    async fn api_devices_get_list(
         this: Arc<HttpServer>,
         _param: APIRouteParam,
-        req: Request<body::Incoming>,
+        _req: Request<body::Incoming>,
     ) -> Result<Response<Full<Bytes>>, HttpError> {
-        let params = API::get_params(&req);
-
-        let page_num = API::params_get_value_default(&params, "page_num", 1 as u64)?;
-        let page_size = API::params_get_value_default(&params, "page_size", 10 as u64)?;
-        if page_num == 0 || page_size == 0 {
-            return API::response_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid parameter: page_num or page_size",
-            );
-        }
-
-        let id = API::params_get_value(&params, "id");
-        let client_ip = API::params_get_value(&params, "client_ip");
-        let hostname = API::params_get_value(&params, "hostname");
-        let mac = API::params_get_value(&params, "mac");
-        let timestamp_after = API::params_get_value(&params, "timestamp_after");
-        let timestamp_before = API::params_get_value(&params, "timestamp_before");
-        let order = API::params_get_value(&params, "order");
-        let cursor = API::params_get_value(&params, "cursor");
-        let cursor_direction =
-            match API::params_get_value_default(&params, "cursor_direction", "next".to_string()) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(e.to_response());
-                }
-            };
-        let total_count = API::params_get_value(&params, "total_count");
-
-        let mut param = ClientListGetParam::new();
-        param.id = id;
-        param.page_num = page_num;
-        param.page_size = page_size;
-        param.client_ip = client_ip;
-        param.hostname = hostname;
-        param.mac = mac;
-        param.order = order;
-        param.timestamp_after = timestamp_after;
-        param.timestamp_before = timestamp_before;
-
-        if cursor.is_some() || total_count.is_some() {
-            let param_cursor = ClientListGetParamCursor {
-                id: if cursor.is_some() { cursor } else { None },
-                total_count: if total_count.is_some() {
-                    total_count.unwrap()
-                } else {
-                    0
-                },
-                direction: cursor_direction,
-            };
-            param.cursor = Some(param_cursor);
-        }
-
         let data_server = this.get_data_server();
-        let ret = API::call_blocking(this, move || {
-            let ret = data_server
-                .get_client_list(&param)
-                .map_err(|e| e.to_string());
-            if let Err(e) = ret {
-                return Err(e.to_string());
+        let devices = Self::get_devices_from_luci(&data_server).await?;
+        let body = serde_json::to_string(&devices)
+            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut response = Response::new(Full::new(Bytes::from(body)));
+        response.headers_mut().insert("Content-Type", "application/json".parse().unwrap());
+        *response.status_mut() = StatusCode::OK;
+        Ok(response)
+    }
+
+    async fn get_devices_from_luci(data_server: &Arc<DataServer>) -> Result<Vec<DeviceInfo>, HttpError> {
+        let output = tokio::task::spawn_blocking(|| {
+            Command::new("ubus")
+                .args(&["call", "luci-rpc", "getHostHints"])
+                .output()
+        }).await
+          .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+          .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let json: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut devices = Vec::new();
+        if let Value::Object(map) = json {
+            for (mac, info) in map {
+                let ipaddrs = info.get("ipaddrs").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let ip6addrs = info.get("ip6addrs").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .filter(|ip| !ip.starts_with("fe80:"))
+                        .collect())
+                    .unwrap_or_default();
+                let hostname = info.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                let last_query_ts = data_server.get_last_query_timestamp_by_mac(&mac)
+                    .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                    .unwrap_or(0);
+
+                devices.push(DeviceInfo {
+                    id: 0,
+                    mac: mac.clone(),
+                    hostname,
+                    ipv4_list: ipaddrs,
+                    ipv6_list: ip6addrs,
+                    last_query_timestamp: last_query_ts,
+                });
             }
-
-            let ret = ret.unwrap();
-
-            return Ok(ret);
-        })
-        .await;
-
-        if let Err(e) = ret {
-            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
-        let ret = ret.unwrap();
-        if let Err(e) = ret {
-            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
+        devices.sort_by(|a, b| b.last_query_timestamp.cmp(&a.last_query_timestamp));
+        for (i, dev) in devices.iter_mut().enumerate() {
+            dev.id = (i + 1) as u64;
         }
-
-        let client_list = ret.unwrap();
-        let list_count = client_list.total_count;
-        let mut total_page = list_count / page_size;
-        if list_count % page_size != 0 {
-            total_page += 1;
-        }
-
-        let total_count = client_list.total_count;
-        let body = api_msg_gen_client_list(&client_list, total_page, total_count);
-
-        API::response_build(StatusCode::OK, body)
+        Ok(devices)
     }
 
     async fn api_log_stream(
