@@ -433,15 +433,12 @@ impl DataServer {
         self.db.delete_domain_before_timestamp(timestamp)
     }
 
-    pub fn delete_client_by_id(&self, id: u64) -> Result<u64, Box<dyn Error>> {
-        self.db.delete_client_by_id(id)
+    pub fn get_last_query_timestamp_by_mac(&self, mac: &str) -> Result<Option<u64>, Box<dyn Error>> {
+        self.db.get_last_query_timestamp_by_mac(mac)
     }
 
-    pub fn get_client_list(
-        &self,
-        param: &ClientListGetParam,
-    ) -> Result<QueryClientListResult, Box<dyn Error>> {
-        self.db.get_client_list(Some(param))
+    pub fn delete_client_by_mac(&self, mac: &str) -> Result<u64, Box<dyn Error>> {
+        self.db.delete_client_by_mac(mac)
     }
 
     pub fn get_top_client_top_list(
