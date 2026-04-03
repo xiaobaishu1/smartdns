@@ -761,39 +761,59 @@ impl API {
     }
 
     async fn get_devices_from_luci(data_server: &Arc<DataServer>) -> Result<Vec<DeviceInfo>, HttpError> {
-        let output = tokio::task::spawn_blocking(|| {
+        let output = match tokio::task::spawn_blocking(|| {
             Command::new("ubus")
                 .args(&["call", "luci-rpc", "getHostHints"])
                 .output()
         })
         .await
-        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        {
+            Ok(Ok(out)) => out,
+            _ => return Ok(Vec::new()),
+        };
 
-        let json: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let json: Value = match serde_json::from_slice(&output.stdout) {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
 
         let mut devices = Vec::new();
         if let Value::Object(map) = json {
             for (mac, info) in map {
-                let ipaddrs: Vec<String> = info.get("ipaddrs").and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                let ipaddrs: Vec<String> = info
+                    .get("ipaddrs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                let ip6addrs: Vec<String> = info.get("ip6addrs").and_then(|v| v.as_array())
-                    .map(|arr| arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .filter(|ip| !ip.starts_with("fe80:"))
-                        .collect())
+
+                let ip6addrs: Vec<String> = info
+                    .get("ip6addrs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .filter(|ip| !ip.starts_with("fe80:"))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 if ipaddrs.is_empty() && ip6addrs.is_empty() {
                     continue;
                 }
 
-                let hostname = info.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let hostname = info
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
                 let normalized_mac = mac.to_lowercase().replace(':', "");
-                let last_query_ts = data_server.get_last_query_timestamp_by_mac(&normalized_mac)
-                    .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                let last_query_ts = data_server
+                    .get_last_query_timestamp_by_mac(&normalized_mac)
                     .unwrap_or(0);
 
                 devices.push(DeviceInfo {
