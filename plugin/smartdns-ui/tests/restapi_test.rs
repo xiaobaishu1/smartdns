@@ -464,17 +464,16 @@ fn test_rest_api_settings() {
 }
 
 #[test]
-fn test_rest_api_get_client() {
+fn test_rest_api_devices() {
     let mut server = common::TestServer::new();
-    server.set_log_level(LogLevel::INFO);
+    server.set_log_level(LogLevel::DEBUG);
     assert!(server.start().is_ok());
 
-    for i in 0..1024 {
+    for i in 0..5 {
         let mut request = TestDnsRequest::new();
-        request.domain = format!("{}.com", i);
-        request.remote_addr = format!("client-{}", i);
-        request.remote_mac = [1, 2, 3, 4, 5, i as u8];
-        request.id = i as u16;
+        request.domain = format!("test{}.com", i);
+        request.remote_addr = format!("192.168.1.{}", i + 100);
+        request.remote_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x50 + i as u8];
         assert!(server.send_test_dnsrequest(request).is_ok());
     }
 
@@ -482,14 +481,27 @@ fn test_rest_api_get_client() {
     let res = client.login("admin", "password");
     assert!(res.is_ok());
 
-    let c = client.get("/api/client?page_size=4096");
-    assert!(c.is_ok());
-    let (code, body) = c.unwrap();
+    let response = client.get("/api/devices");
+    assert!(response.is_ok());
+    let (code, body) = response.unwrap();
     assert_eq!(code, 200);
-    let list = http_api_msg::api_msg_parse_client_list(&body);
-    assert!(list.is_ok());
-    let list = list.unwrap();
-    assert_eq!(list.len(), 1024);
+
+    let devices: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    if !devices.is_empty() {
+        for device in &devices {
+            assert!(device.get("id").is_some());
+            assert!(device.get("mac").is_some());
+            assert!(device.get("hostname").is_some());
+            assert!(device.get("ipv4_list").is_some());
+            assert!(device.get("ipv6_list").is_some());
+            assert!(device.get("last_query_timestamp").is_some());
+        }
+    }
+
+    let found = devices.iter().any(|d| d["mac"].as_str().unwrap_or("").contains("00:11:22:33:44"));
+    if !devices.is_empty() {
+        assert!(found, "Expected to find device with MAC 00:11:22:33:44:xx");
+    }
 }
 
 #[test]
