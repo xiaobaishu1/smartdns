@@ -474,7 +474,6 @@ fn test_rest_api_devices() {
         request.domain = format!("test{}.com", i);
         request.remote_addr = format!("192.168.1.{}", i + 100);
         request.remote_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x50 + i as u8];
-        request.hostname = format!("device-{}", i);
         assert!(server.send_test_dnsrequest(request).is_ok());
     }
 
