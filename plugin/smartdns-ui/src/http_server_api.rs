@@ -559,8 +559,9 @@ impl API {
             Some(m) => m,
             None => return API::response_error(StatusCode::BAD_REQUEST, "Missing mac parameter"),
         };
+        let mac_decoded = mac.replace("%3A", ":").replace("%3a", ":");
         let data_server = this.get_data_server();
-        let deleted = data_server.delete_client_by_mac(mac)
+        let deleted = data_server.delete_client_by_mac(&mac_decoded)
             .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if deleted == 0 {
             return API::response_error(StatusCode::NOT_FOUND, "No client found for this MAC");
