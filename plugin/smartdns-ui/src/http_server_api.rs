@@ -783,6 +783,10 @@ impl API {
         }
     };
 
+    // Batch fetch all last query timestamps for MACs
+    let timestamp_map = data_server.get_all_last_query_timestamps()
+        .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     let mut devices = Vec::new();
     if let Value::Object(map) = json {
         for (mac, info) in map {
@@ -797,9 +801,8 @@ impl API {
                 .unwrap_or_default();
             let hostname = info.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-            let last_query_ts = data_server.get_last_query_timestamp_by_mac(&mac)
-                .map_err(|e| HttpError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .unwrap_or(0);
+            let normalized_mac = mac.to_lowercase().replace(':', "").replace('-', "");
+            let last_query_ts = timestamp_map.get(&normalized_mac).copied().unwrap_or(0);
 
             devices.push(DeviceInfo {
                 id: 0,
