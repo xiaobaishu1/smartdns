@@ -1420,27 +1420,30 @@ impl DB {
         Ok(())
     }
 
-    /// Get the latest last_query_timestamp for a given MAC address
-pub fn get_last_query_timestamp_by_mac(&self, mac: &str) -> Result<Option<u64>, Box<dyn Error>> {
-    let conn = match self.get_readonly_conn() {
-        Some(c) => c,
-        None => return Err("db is not open".into()),
-    };
+    /// Get the latest last_query_timestamp for all MAC addresses, grouped by MAC.
+    /// Returns a HashMap mapping MAC (as stored in DB, with separators) to the max timestamp.
+    pub fn get_all_last_query_timestamps(&self) -> Result<HashMap<String, u64>, Box<dyn Error>> {
+        let conn = match self.get_readonly_conn() {
+            Some(c) => c,
+            None => return Err("db is not open".into()),
+        };
 
-    let normalized_mac = mac.to_lowercase().replace(|c| c == ':' || c == '-', "");
-
-    let mut stmt = conn.prepare(
-        "SELECT MAX(last_query_timestamp) FROM client 
-         WHERE REPLACE(REPLACE(mac, ':', ''), '-', '') = ?1"
-    )?;
-
-    let mut rows = stmt.query([normalized_mac])?;
-    if let Some(row) = rows.next()? {
-        let ts: Option<u64> = row.get(0)?;
-        return Ok(ts);
+        let mut stmt = conn.prepare(
+            "SELECT mac, MAX(last_query_timestamp) FROM client GROUP BY mac"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let mac: String = row.get(0)?;
+            let ts: u64 = row.get(1)?;
+            let normalized = mac.to_lowercase().replace(':', "").replace('-', "");
+            Ok((normalized, ts))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (normalized_mac, ts) = row?;
+            map.insert(normalized_mac, ts);
+        }
+        Ok(map)
     }
-    Ok(None)
-}
 
     /// Delete all clients with a given MAC address
     pub fn delete_client_by_mac(&self, mac: &str) -> Result<u64, Box<dyn Error>> {
