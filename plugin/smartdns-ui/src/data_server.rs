@@ -433,8 +433,8 @@ impl DataServer {
         self.db.delete_domain_before_timestamp(timestamp)
     }
 
-    pub fn get_last_query_timestamp_by_mac(&self, mac: &str) -> Result<Option<u64>, Box<dyn Error>> {
-        self.db.get_last_query_timestamp_by_mac(mac)
+    pub fn get_all_last_query_timestamps(&self) -> Result<HashMap<String, u64>, Box<dyn Error>> {
+        self.db.get_all_last_query_timestamps()
     }
 
     pub fn delete_client_by_mac(&self, mac: &str) -> Result<u64, Box<dyn Error>> {
