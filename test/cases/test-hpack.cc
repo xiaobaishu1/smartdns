@@ -246,11 +246,11 @@ TEST(HPACKDynamicTable, TailPointerMaintained) {
     EXPECT_NE(ctx.dynamic_table_tail, nullptr);
     EXPECT_STREQ(ctx.dynamic_table_tail->name, "first");
 
-+    // Shrink the dynamic table size to force eviction of the oldest entry.
-+    // Total size of the three entries is about 115 bytes, so setting max to 80
-+    // ensures at least one entry is evicted.
-+    hpack_resize_dynamic_table(&ctx, 80);
-+    EXPECT_EQ(ctx.entry_count, 2);          // one entry evicted
+    // Shrink the dynamic table size to force eviction of the oldest entry.
+    // Total size of the three entries is about 115 bytes, so setting max to 80
+    // ensures at least one entry is evicted.
+    hpack_resize_dynamic_table(&ctx, 80);
+    EXPECT_EQ(ctx.entry_count, 2);          // one entry evicted
     EXPECT_NE(ctx.dynamic_table_tail, nullptr);
     EXPECT_STREQ(ctx.dynamic_table_tail->name, "second");
 
