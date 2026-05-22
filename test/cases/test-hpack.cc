@@ -17,7 +17,7 @@
  */
 
 #include "gtest/gtest.h"
-#include "http_parse/hpack.h"
+#include "hpack.h"
 #include <string>
 #include <vector>
 #include <cstring>
@@ -246,11 +246,11 @@ TEST(HPACKDynamicTable, TailPointerMaintained) {
     EXPECT_NE(ctx.dynamic_table_tail, nullptr);
     EXPECT_STREQ(ctx.dynamic_table_tail->name, "first");
 
-    // Add a large entry that forces eviction of the oldest
-    // Make entry size large enough to evict at least one entry
-    // We can't easily create a huge entry without writing long strings, but we can shrink max size
-    hpack_resize_dynamic_table(&ctx, 150); // force eviction
-    // After eviction, tail should be the next oldest ("second")
++    // Shrink the dynamic table size to force eviction of the oldest entry.
++    // Total size of the three entries is about 115 bytes, so setting max to 80
++    // ensures at least one entry is evicted.
++    hpack_resize_dynamic_table(&ctx, 80);
++    EXPECT_EQ(ctx.entry_count, 2);          // one entry evicted
     EXPECT_NE(ctx.dynamic_table_tail, nullptr);
     EXPECT_STREQ(ctx.dynamic_table_tail->name, "second");
 
