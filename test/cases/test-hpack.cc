@@ -17,7 +17,7 @@
  */
 
 #include "gtest/gtest.h"
-#include "hpack.h"
+#include "../src/http_parse/hpack.h"
 #include <string>
 #include <vector>
 #include <cstring>
