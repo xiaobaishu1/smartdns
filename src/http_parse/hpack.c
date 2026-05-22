@@ -3,11 +3,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* clang-format on */
+#define HPACK_STATIC_TABLE_SIZE (sizeof(hpack_static_table) / sizeof(hpack_static_table[0]))
+#define HUFFMAN_TABLE_SIZE (sizeof(huffman_table) / sizeof(huffman_table[0]))
+#define HPACK_HUFFMAN_FAST_BITS 12
+#define HPACK_HUFFMAN_FAST_SIZE (1 << HPACK_HUFFMAN_FAST_BITS)
+
+/* HPACK Huffman decoding table based on RFC 7541 Appendix B */
+/* Each entry contains: symbol, code length in bits */
+struct huffman_decode_entry {
+	uint32_t bits;
+	uint8_t nbits;
+	uint16_t symbol;
+};
+
 /* HPACK static table (RFC 7541 Appendix A) */
 struct hpack_static_entry {
 	const char *name;
 	const char *value;
 };
+
+/* Huffman encoding table: maps symbol (0-255) to {code, nbits} */
+struct huffman_encoding_entry {
+	uint32_t code;
+	uint8_t nbits;
+};
+
+typedef struct {
+	uint16_t symbol;
+	uint8_t nbits;
+	uint8_t need_more;
+} huffman_fast_entry_t;
 
 /* clang-format off */
 static const struct hpack_static_entry hpack_static_table[] = {
@@ -73,9 +99,267 @@ static const struct hpack_static_entry hpack_static_table[] = {
 	{"via", ""},
 	{"www-authenticate", ""}
 };
-/* clang-format on */
 
-#define HPACK_STATIC_TABLE_SIZE (sizeof(hpack_static_table) / sizeof(hpack_static_table[0]))
+/* Complete Huffman decoding table for HPACK (RFC 7541 Appendix B) */
+static const struct huffman_decode_entry huffman_table[] = {
+	{0x00, 5, '0'},      /*  48 */
+	{0x01, 5, '1'},      /*  49 */
+	{0x02, 5, '2'},      /*  50 */
+	{0x03, 5, 'a'},      /*  97 */
+	{0x04, 5, 'c'},      /*  99 */
+	{0x05, 5, 'e'},      /* 101 */
+	{0x06, 5, 'i'},      /* 105 */
+	{0x07, 5, 'o'},      /* 111 */
+	{0x08, 5, 's'},      /* 115 */
+	{0x09, 5, 't'},      /* 116 */
+	{0x14, 6, ' '},      /*  32 */
+	{0x15, 6, '%'},      /*  37 */
+	{0x16, 6, '-'},      /*  45 */
+	{0x17, 6, '.'},      /*  46 */
+	{0x18, 6, '/'},      /*  47 */
+	{0x19, 6, '3'},      /*  51 */
+	{0x1a, 6, '4'},      /*  52 */
+	{0x1b, 6, '5'},      /*  53 */
+	{0x1c, 6, '6'},      /*  54 */
+	{0x1d, 6, '7'},      /*  55 */
+	{0x1e, 6, '8'},      /*  56 */
+	{0x1f, 6, '9'},      /*  57 */
+	{0x20, 6, '='},      /*  61 */
+	{0x21, 6, 'A'},      /*  65 */
+	{0x22, 6, '_'},      /*  95 */
+	{0x23, 6, 'b'},      /*  98 */
+	{0x24, 6, 'd'},      /* 100 */
+	{0x25, 6, 'f'},      /* 102 */
+	{0x26, 6, 'g'},      /* 103 */
+	{0x27, 6, 'h'},      /* 104 */
+	{0x28, 6, 'l'},      /* 108 */
+	{0x29, 6, 'm'},      /* 109 */
+	{0x2a, 6, 'n'},      /* 110 */
+	{0x2b, 6, 'p'},      /* 112 */
+	{0x2c, 6, 'r'},      /* 114 */
+	{0x2d, 6, 'u'},      /* 117 */
+	{0x5c, 7, ':'},      /*  58 */
+	{0x5d, 7, 'B'},      /*  66 */
+	{0x5e, 7, 'C'},      /*  67 */
+	{0x5f, 7, 'D'},      /*  68 */
+	{0x60, 7, 'E'},      /*  69 */
+	{0x61, 7, 'F'},      /*  70 */
+	{0x62, 7, 'G'},      /*  71 */
+	{0x63, 7, 'H'},      /*  72 */
+	{0x64, 7, 'I'},      /*  73 */
+	{0x65, 7, 'J'},      /*  74 */
+	{0x66, 7, 'K'},      /*  75 */
+	{0x67, 7, 'L'},      /*  76 */
+	{0x68, 7, 'M'},      /*  77 */
+	{0x69, 7, 'N'},      /*  78 */
+	{0x6a, 7, 'O'},      /*  79 */
+	{0x6b, 7, 'P'},      /*  80 */
+	{0x6c, 7, 'Q'},      /*  81 */
+	{0x6d, 7, 'R'},      /*  82 */
+	{0x6e, 7, 'S'},      /*  83 */
+	{0x6f, 7, 'T'},      /*  84 */
+	{0x70, 7, 'U'},      /*  85 */
+	{0x71, 7, 'V'},      /*  86 */
+	{0x72, 7, 'W'},      /*  87 */
+	{0x73, 7, 'Y'},      /*  89 */
+	{0x74, 7, 'j'},      /* 106 */
+	{0x75, 7, 'k'},      /* 107 */
+	{0x76, 7, 'q'},      /* 113 */
+	{0x77, 7, 'v'},      /* 118 */
+	{0x78, 7, 'w'},      /* 119 */
+	{0x79, 7, 'x'},      /* 120 */
+	{0x7a, 7, 'y'},      /* 121 */
+	{0x7b, 7, 'z'},      /* 122 */
+	{0xf8, 8, '&'},      /*  38 */
+	{0xf9, 8, '*'},      /*  42 */
+	{0xfa, 8, ','},      /*  44 */
+	{0xfb, 8, ';'},      /*  59 */
+	{0xfc, 8, 'X'},      /*  88 */
+	{0xfd, 8, 'Z'},      /*  90 */
+	{0x3f8, 10, '!'},    /*  33 */
+	{0x3f9, 10, '"'},    /*  34 */
+	{0x3fa, 10, '('},    /*  40 */
+	{0x3fb, 10, ')'},    /*  41 */
+	{0x3fc, 10, '?'},    /*  63 */
+	{0x7fa, 11, '\''},   /*  39 */
+	{0x7fb, 11, '+'},    /*  43 */
+	{0x7fc, 11, '|'},    /* 124 */
+	{0xffa, 12, '#'},    /*  35 */
+	{0xffb, 12, '>'},    /*  62 */
+	{0x1ff8, 13, 0x00},  /*   0 */
+	{0x1ff9, 13, '$'},   /*  36 */
+	{0x1ffa, 13, '@'},   /*  64 */
+	{0x1ffb, 13, '['},   /*  91 */
+	{0x1ffc, 13, ']'},   /*  93 */
+	{0x1ffd, 13, '~'},   /* 126 */
+	{0x3ffc, 14, '^'},   /*  94 */
+	{0x3ffd, 14, '}'},   /* 125 */
+	{0x7ffc, 15, '<'},   /*  60 */
+	{0x7ffd, 15, '`'},   /*  96 */
+	{0x7ffe, 15, '{'},   /* 123 */
+	{0x7fff0, 19, '\\'}, /*  92 */
+	{0x7fff1, 19, 0xc3}, /* 195 */
+	{0x7fff2, 19, 0xd0}, /* 208 */
+	{0xfffe6, 20, 0x80}, /* 128 */
+	{0xfffe7, 20, 0x82}, /* 130 */
+	{0xfffe8, 20, 0x83}, /* 131 */
+	{0xfffe9, 20, 0xa2}, /* 162 */
+	{0xfffea, 20, 0xb8}, /* 184 */
+	{0xfffeb, 20, 0xc2}, /* 194 */
+	{0xfffec, 20, 0xe0}, /* 224 */
+	{0xfffed, 20, 0xe2}, /* 226 */
+	{0x1fffdc, 21, 0x99}, /* 153 */
+	{0x1fffdd, 21, 0xa1}, /* 161 */
+	{0x1fffde, 21, 0xa7}, /* 167 */
+	{0x1fffdf, 21, 0xac}, /* 172 */
+	{0x1fffe0, 21, 0xb0}, /* 176 */
+	{0x1fffe1, 21, 0xb1}, /* 177 */
+	{0x1fffe2, 21, 0xb3}, /* 179 */
+	{0x1fffe3, 21, 0xd1}, /* 209 */
+	{0x1fffe4, 21, 0xd8}, /* 216 */
+	{0x1fffe5, 21, 0xd9}, /* 217 */
+	{0x1fffe6, 21, 0xe3}, /* 227 */
+	{0x1fffe7, 21, 0xe5}, /* 229 */
+	{0x1fffe8, 21, 0xe6}, /* 230 */
+	{0x3fffd2, 22, 0x81}, /* 129 */
+	{0x3fffd3, 22, 0x84}, /* 132 */
+	{0x3fffd4, 22, 0x85}, /* 133 */
+	{0x3fffd5, 22, 0x86}, /* 134 */
+	{0x3fffd6, 22, 0x88}, /* 136 */
+	{0x3fffd7, 22, 0x92}, /* 146 */
+	{0x3fffd8, 22, 0x9a}, /* 154 */
+	{0x3fffd9, 22, 0x9c}, /* 156 */
+	{0x3fffda, 22, 0xa0}, /* 160 */
+	{0x3fffdb, 22, 0xa3}, /* 163 */
+	{0x3fffdc, 22, 0xa4}, /* 164 */
+	{0x3fffdd, 22, 0xa9}, /* 169 */
+	{0x3fffde, 22, 0xaa}, /* 170 */
+	{0x3fffdf, 22, 0xad}, /* 173 */
+	{0x3fffe0, 22, 0xb2}, /* 178 */
+	{0x3fffe1, 22, 0xb5}, /* 181 */
+	{0x3fffe2, 22, 0xb9}, /* 185 */
+	{0x3fffe3, 22, 0xba}, /* 186 */
+	{0x3fffe4, 22, 0xbb}, /* 187 */
+	{0x3fffe5, 22, 0xbd}, /* 189 */
+	{0x3fffe6, 22, 0xbe}, /* 190 */
+	{0x3fffe7, 22, 0xc4}, /* 196 */
+	{0x3fffe8, 22, 0xc6}, /* 198 */
+	{0x3fffe9, 22, 0xe4}, /* 228 */
+	{0x3fffea, 22, 0xe8}, /* 232 */
+	{0x3fffeb, 22, 0xe9}, /* 233 */
+	{0x7fffd8, 23, 0x01}, /*   1 */
+	{0x7fffd9, 23, 0x87}, /* 135 */
+	{0x7fffda, 23, 0x89}, /* 137 */
+	{0x7fffdb, 23, 0x8a}, /* 138 */
+	{0x7fffdc, 23, 0x8b}, /* 139 */
+	{0x7fffdd, 23, 0x8c}, /* 140 */
+	{0x7fffde, 23, 0x8d}, /* 141 */
+	{0x7fffdf, 23, 0x8f}, /* 143 */
+	{0x7fffe0, 23, 0x93}, /* 147 */
+	{0x7fffe1, 23, 0x95}, /* 149 */
+	{0x7fffe2, 23, 0x96}, /* 150 */
+	{0x7fffe3, 23, 0x97}, /* 151 */
+	{0x7fffe4, 23, 0x98}, /* 152 */
+	{0x7fffe5, 23, 0x9b}, /* 155 */
+	{0x7fffe6, 23, 0x9d}, /* 157 */
+	{0x7fffe7, 23, 0x9e}, /* 158 */
+	{0x7fffe8, 23, 0xa5}, /* 165 */
+	{0x7fffe9, 23, 0xa6}, /* 166 */
+	{0x7fffea, 23, 0xa8}, /* 168 */
+	{0x7fffeb, 23, 0xae}, /* 174 */
+	{0x7fffec, 23, 0xaf}, /* 175 */
+	{0x7fffed, 23, 0xb4}, /* 180 */
+	{0x7fffee, 23, 0xb6}, /* 182 */
+	{0x7fffef, 23, 0xb7}, /* 183 */
+	{0x7ffff0, 23, 0xbc}, /* 188 */
+	{0x7ffff1, 23, 0xbf}, /* 191 */
+	{0x7ffff2, 23, 0xc5}, /* 197 */
+	{0x7ffff3, 23, 0xe7}, /* 231 */
+	{0x7ffff4, 23, 0xef}, /* 239 */
+	{0xffffea, 24, 0x09}, /*   9 */
+	{0xffffeb, 24, 0x8e}, /* 142 */
+	{0xffffec, 24, 0x90}, /* 144 */
+	{0xffffed, 24, 0x91}, /* 145 */
+	{0xffffee, 24, 0x94}, /* 148 */
+	{0xffffef, 24, 0x9f}, /* 159 */
+	{0xfffff0, 24, 0xab}, /* 171 */
+	{0xfffff1, 24, 0xce}, /* 206 */
+	{0xfffff2, 24, 0xd7}, /* 215 */
+	{0xfffff3, 24, 0xe1}, /* 225 */
+	{0xfffff4, 24, 0xec}, /* 236 */
+	{0xfffff5, 24, 0xed}, /* 237 */
+	{0x1ffffec, 25, 0xc7}, /* 199 */
+	{0x1ffffed, 25, 0xcf}, /* 207 */
+	{0x1ffffee, 25, 0xea}, /* 234 */
+	{0x1ffffef, 25, 0xeb}, /* 235 */
+	{0x3ffffe0, 26, 0xc0}, /* 192 */
+	{0x3ffffe1, 26, 0xc1}, /* 193 */
+	{0x3ffffe2, 26, 0xc8}, /* 200 */
+	{0x3ffffe3, 26, 0xc9}, /* 201 */
+	{0x3ffffe4, 26, 0xca}, /* 202 */
+	{0x3ffffe5, 26, 0xcd}, /* 205 */
+	{0x3ffffe6, 26, 0xd2}, /* 210 */
+	{0x3ffffe7, 26, 0xd5}, /* 213 */
+	{0x3ffffe8, 26, 0xda}, /* 218 */
+	{0x3ffffe9, 26, 0xdb}, /* 219 */
+	{0x3ffffea, 26, 0xee}, /* 238 */
+	{0x3ffffeb, 26, 0xf0}, /* 240 */
+	{0x3ffffec, 26, 0xf2}, /* 242 */
+	{0x3ffffed, 26, 0xf3}, /* 243 */
+	{0x3ffffee, 26, 0xff}, /* 255 */
+	{0x7ffffde, 27, 0xcb}, /* 203 */
+	{0x7ffffdf, 27, 0xcc}, /* 204 */
+	{0x7ffffe0, 27, 0xd3}, /* 211 */
+	{0x7ffffe1, 27, 0xd4}, /* 212 */
+	{0x7ffffe2, 27, 0xd6}, /* 214 */
+	{0x7ffffe3, 27, 0xdd}, /* 221 */
+	{0x7ffffe4, 27, 0xde}, /* 222 */
+	{0x7ffffe5, 27, 0xdf}, /* 223 */
+	{0x7ffffe6, 27, 0xf1}, /* 241 */
+	{0x7ffffe7, 27, 0xf4}, /* 244 */
+	{0x7ffffe8, 27, 0xf5}, /* 245 */
+	{0x7ffffe9, 27, 0xf6}, /* 246 */
+	{0x7ffffea, 27, 0xf7}, /* 247 */
+	{0x7ffffeb, 27, 0xf8}, /* 248 */
+	{0x7ffffec, 27, 0xfa}, /* 250 */
+	{0x7ffffed, 27, 0xfb}, /* 251 */
+	{0x7ffffee, 27, 0xfc}, /* 252 */
+	{0x7ffffef, 27, 0xfd}, /* 253 */
+	{0x7fffff0, 27, 0xfe}, /* 254 */
+	{0xfffffe2, 28, 0x02}, /*   2 */
+	{0xfffffe3, 28, 0x03}, /*   3 */
+	{0xfffffe4, 28, 0x04}, /*   4 */
+	{0xfffffe5, 28, 0x05}, /*   5 */
+	{0xfffffe6, 28, 0x06}, /*   6 */
+	{0xfffffe7, 28, 0x07}, /*   7 */
+	{0xfffffe8, 28, 0x08}, /*   8 */
+	{0xfffffe9, 28, 0x0b}, /*  11 */
+	{0xfffffea, 28, 0x0c}, /*  12 */
+	{0xfffffeb, 28, 0x0e}, /*  14 */
+	{0xfffffec, 28, 0x0f}, /*  15 */
+	{0xfffffed, 28, 0x10}, /*  16 */
+	{0xfffffee, 28, 0x11}, /*  17 */
+	{0xfffffef, 28, 0x12}, /*  18 */
+	{0xffffff0, 28, 0x13}, /*  19 */
+	{0xffffff1, 28, 0x14}, /*  20 */
+	{0xffffff2, 28, 0x15}, /*  21 */
+	{0xffffff3, 28, 0x17}, /*  23 */
+	{0xffffff4, 28, 0x18}, /*  24 */
+	{0xffffff5, 28, 0x19}, /*  25 */
+	{0xffffff6, 28, 0x1a}, /*  26 */
+	{0xffffff7, 28, 0x1b}, /*  27 */
+	{0xffffff8, 28, 0x1c}, /*  28 */
+	{0xffffff9, 28, 0x1d}, /*  29 */
+	{0xffffffa, 28, 0x1e}, /*  30 */
+	{0xffffffb, 28, 0x1f}, /*  31 */
+	{0xffffffc, 28, 0x7f}, /* 127 */
+	{0xffffffd, 28, 0xdc}, /* 220 */
+	{0xffffffe, 28, 0xf9}, /* 249 */
+	{0x3ffffffc, 30, 0x0a}, /*  10 */
+	{0x3ffffffd, 30, 0x0d}, /*  13 */
+	{0x3ffffffe, 30, 0x16}, /*  22 */
+	{0x3fffffff, 30, 0x100} /* 256 (EOS) */
+};
 
 /* HPACK integer encoding/decoding */
 
@@ -146,301 +430,188 @@ static int hpack_decode_integer(const uint8_t *data, int data_len, int prefix_bi
 	return -1;
 }
 
-/* HPACK string encoding/decoding */
+/* Get the fast Huffman decoding table (function‑local static) */
 
-static int hpack_encode_string(const char *str, uint8_t *buf, int buf_size)
+static const huffman_fast_entry_t* get_huffman_fast_table(void)
 {
-	int len = strlen(str);
-	int offset = 0;
-	int ret;
+	static huffman_fast_entry_t table[HPACK_HUFFMAN_FAST_SIZE];
+	static int initialized = 0;
+	int i;
 
-	if (buf_size < 1) {
-		return -1;
+	if (initialized)
+		return table;
+
+	memset(table, 0xff, sizeof(table));
+	for (i = 0; i < HUFFMAN_TABLE_SIZE; i++) {
+		uint32_t bits = huffman_table[i].bits;
+		uint8_t nbits = huffman_table[i].nbits;
+		uint16_t sym = huffman_table[i].symbol;
+		if (sym == 256) continue; /* ignore EOS */
+
+		if (nbits <= HPACK_HUFFMAN_FAST_BITS) {
+			uint32_t base = bits << (HPACK_HUFFMAN_FAST_BITS - nbits);
+			uint32_t count = 1 << (HPACK_HUFFMAN_FAST_BITS - nbits);
+			for (uint32_t j = 0; j < count; j++) {
+				uint32_t idx = base | j;
+				table[idx].symbol = sym;
+				table[idx].nbits = nbits;
+				table[idx].need_more = 0;
+			}
+		} else {
+			uint32_t top = bits >> (nbits - HPACK_HUFFMAN_FAST_BITS);
+			if (top < HPACK_HUFFMAN_FAST_SIZE) {
+				/* Only set if not already set to a shorter code (rare) */
+				if (table[top].need_more == 0 && table[top].symbol != (uint16_t)-1)
+					continue;
+				table[top].symbol = sym;
+				table[top].nbits = nbits;
+				table[top].need_more = 1;
+			}
+		}
 	}
-
-	buf[offset] = 0; /* No Huffman encoding */
-	ret = hpack_encode_integer(len, 7, buf + offset, buf_size - offset);
-	if (ret < 0) {
-		return -1;
-	}
-	offset += ret;
-
-	if (offset + len > buf_size) {
-		return -1;
-	}
-
-	memcpy(buf + offset, str, len);
-	offset += len;
-
-	return offset;
+	initialized = 1;
+	return table;
 }
 
-/* HPACK Huffman decoding table based on RFC 7541 Appendix B */
-/* Each entry contains: symbol, code length in bits */
-struct huffman_decode_entry {
-	uint32_t bits;  /* Huffman code bits */
-	uint8_t nbits;  /* Number of bits in code */
-	uint8_t symbol; /* Decoded symbol */
-};
+/* Fallback decoder for long codes (length > 12 bits) */
 
-/* Complete Huffman decoding table for HPACK (RFC 7541 Appendix B) */
-/* Sorted by code for binary search */
-static const struct huffman_decode_entry huffman_table[] = {
-	/* 5-bit codes */
-	{0x00, 5, '0'},
-	{0x01, 5, '1'},
-	{0x02, 5, '2'},
-	{0x03, 5, 'a'},
-	{0x04, 5, 'c'},
-	{0x05, 5, 'e'},
-	{0x06, 5, 'i'},
-	{0x07, 5, 'o'},
-	{0x08, 5, 's'},
-	{0x09, 5, 't'},
-
-	/* 6-bit codes */
-	{0x14, 6, ' '},
-	{0x15, 6, '%'},
-	{0x16, 6, '-'},
-	{0x17, 6, '.'},
-	{0x18, 6, '/'},
-	{0x19, 6, '3'},
-	{0x1a, 6, '4'},
-	{0x1b, 6, '5'},
-	{0x1c, 6, '6'},
-	{0x1d, 6, '7'},
-	{0x1e, 6, '8'},
-	{0x1f, 6, '9'},
-	{0x20, 6, '='},
-	{0x21, 6, 'A'},
-	{0x22, 6, '_'},
-	{0x23, 6, 'b'},
-	{0x24, 6, 'd'},
-	{0x25, 6, 'f'},
-	{0x26, 6, 'g'},
-	{0x27, 6, 'h'},
-	{0x28, 6, 'l'},
-	{0x29, 6, 'm'},
-	{0x2a, 6, 'n'},
-	{0x2b, 6, 'p'},
-	{0x2c, 6, 'r'},
-	{0x2d, 6, 'u'},
-
-	/* 7-bit codes */
-	{0x5c, 7, ':'},
-	{0x5d, 7, 'B'},
-	{0x5e, 7, 'C'},
-	{0x5f, 7, 'D'},
-	{0x60, 7, 'E'},
-	{0x61, 7, 'F'},
-	{0x62, 7, 'G'},
-	{0x63, 7, 'H'},
-	{0x64, 7, 'I'},
-	{0x65, 7, 'J'},
-	{0x66, 7, 'K'},
-	{0x67, 7, 'L'},
-	{0x68, 7, 'M'},
-	{0x69, 7, 'N'},
-	{0x6a, 7, 'O'},
-	{0x6b, 7, 'P'},
-	{0x6c, 7, 'Q'},
-	{0x6d, 7, 'R'},
-	{0x6e, 7, 'S'},
-	{0x6f, 7, 'T'},
-	{0x70, 7, 'U'},
-	{0x71, 7, 'V'},
-	{0x72, 7, 'W'},
-	{0x73, 7, 'Y'},
-	{0x74, 7, 'j'},
-	{0x75, 7, 'k'},
-	{0x76, 7, 'q'},
-	{0x77, 7, 'v'},
-	{0x78, 7, 'w'},
-	{0x79, 7, 'x'},
-	{0x7a, 7, 'y'},
-	{0x7b, 7, 'z'},
-
-	/* 8-bit codes */
-	{0xf8, 8, '&'},
-	{0xf9, 8, '*'},
-	{0xfa, 8, ','},
-	{0xfb, 8, ';'},
-	{0xfc, 8, 'X'},
-	{0xfd, 8, 'Z'},
-
-	/* 10-bit codes */
-	{0x3f8, 10, '!'},
-	{0x3f9, 10, '"'},
-	{0x3fa, 10, '('},
-	{0x3fb, 10, ')'},
-	{0x3fc, 10, '?'},
-
-	/* 11-bit codes */
-	{0x7fa, 11, '#'},
-	{0x7fb, 11, '>'},
-
-	/* 12-bit codes */
-	{0xffa, 12, '$'},
-	{0xffb, 12, '@'},
-	{0xffc, 12, '['},
-	{0xffd, 12, ']'},
-	{0xffe, 12, '~'},
-
-	/* 13-bit codes */
-	{0x1ff8, 13, '+'},
-	{0x1ff9, 13, '<'},
-	{0x1ffa, 13, '\\'},
-
-	/* 14-bit codes */
-	{0x3ffc, 14, '\''},
-	{0x3ffd, 14, '|'},
-
-	/* 15-bit codes */
-	{0x7ffc, 15, '`'},
-	{0x7ffd, 15, '{'},
-
-	/* 19-bit codes */
-	{0x7fff0, 19, '}'},
-
-	/* 20-bit codes and above - less common characters */
-	{0xffff8, 20, 0x00},
-	{0xffff9, 20, 0x01},
-	{0xffffa, 20, 0x02},
-	{0xffffb, 20, 0x03},
-	{0xffffc, 20, 0x04},
-	{0xffffd, 20, 0x05},
-	{0xffffe, 20, 0x06},
-	{0xfffff, 20, 0x07},
-	{0x1ffff8, 21, 0x08},
-	{0x1ffff9, 21, 0x09},
-	{0x1ffffa, 21, 0x0a},
-	{0x1ffffb, 21, 0x0b},
-	{0x1ffffc, 21, 0x0c},
-	{0x1ffffd, 21, 0x0d},
-	{0x1ffffe, 21, 0x0e},
-	{0x1fffff, 21, 0x0f},
-	{0x3ffff8, 22, 0x10},
-	{0x3ffff9, 22, 0x11},
-	{0x3ffffa, 22, 0x12},
-	{0x3ffffb, 22, 0x13},
-	{0x3ffffc, 22, 0x14},
-	{0x3ffffd, 22, 0x15},
-	{0x3ffffe, 22, 0x16},
-	{0x3fffff, 22, 0x17},
-	{0x7ffff8, 23, 0x18},
-	{0x7ffff9, 23, 0x19},
-	{0x7ffffa, 23, 0x1a},
-	{0x7ffffb, 23, 0x1b},
-	{0x7ffffc, 23, 0x1c},
-	{0x7ffffd, 23, 0x1d},
-	{0x7ffffe, 23, 0x1e},
-	{0x7fffff, 23, 0x1f},
-	{0xfffff8, 24, 0x7f},
-	{0xfffff9, 24, 0x20},
-	{0xfffffa, 24, 0x21},
-	{0xfffffb, 24, 0x22},
-	{0xfffffc, 24, 0x23},
-	{0xfffffd, 24, 0x24},
-	{0xfffffe, 24, 0x25},
-	{0xffffff, 24, 0x26},
-	{0x1fffff8, 25, 0x27},
-	{0x1fffff9, 25, 0x28},
-	{0x1fffffa, 25, 0x29},
-	{0x1fffffb, 25, 0x2a},
-	{0x1fffffc, 25, 0x2b},
-	{0x1fffffd, 25, 0x2c},
-	{0x1fffffe, 25, 0x2d},
-	{0x1ffffff, 25, 0x2e},
-	{0x3fffff8, 26, 0x2f},
-	{0x3fffff9, 26, 0x30},
-	{0x3fffffa, 26, 0x31},
-	{0x3fffffb, 26, 0x32},
-	{0x3fffffc, 26, 0x33},
-	{0x3fffffd, 26, 0x34},
-	{0x3fffffe, 26, 0x35},
-	{0x3ffffff, 26, 0x36},
-	{0x7fffff8, 27, 0x37},
-	{0x7fffff9, 27, 0x38},
-	{0x7fffffa, 27, 0x39},
-	{0x7fffffb, 27, 0x3a},
-	{0x7fffffc, 27, 0x3b},
-	{0x7fffffd, 27, 0x3c},
-	{0x7fffffe, 27, 0x3d},
-	{0x7ffffff, 27, 0x3e},
-	{0xffffff8, 28, 0x3f},
-	{0xffffff9, 28, 0x40},
-	{0xffffffa, 28, 0x41},
-	{0xffffffb, 28, 0x42},
-	{0xffffffc, 28, 0x43},
-	{0xffffffd, 28, 0x44},
-	{0xffffffe, 28, 0x45},
-	{0xfffffff, 28, 0x46},
-};
-
-#define HUFFMAN_TABLE_SIZE (sizeof(huffman_table) / sizeof(huffman_table[0]))
-
-/* Huffman decoder using bit-by-bit decoding */
-static int hpack_decode_huffman(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len)
+static int hpack_decode_huffman_long(uint64_t bit_buffer, int bits_avail, uint8_t *dst,
+                                     size_t dst_len, size_t *dst_pos)
 {
+	uint64_t total_bits = bits_avail;
+	uint64_t bits = bit_buffer;
+	int len;
+	for (len = total_bits; len >= HPACK_HUFFMAN_FAST_BITS + 1; len--) {
+		uint32_t code = (uint32_t)((bits >> (total_bits - len)) & ((1ULL << len) - 1));
+		size_t j;
+		for (j = 0; j < HUFFMAN_TABLE_SIZE; j++) {
+			if (huffman_table[j].nbits == len && huffman_table[j].bits == code) {
+				if (huffman_table[j].symbol == 256)
+					return -1;
+				if (*dst_pos >= dst_len)
+					return -1;
+				dst[(*dst_pos)++] = (uint8_t)huffman_table[j].symbol;
+				/* Consume len bits (will be handled by caller) */
+				return len;
+			}
+		}
+	}
+	return -1;
+}
+
+/* Huffman decoder using fast 12‑bit lookup table */
+
+int hpack_decode_huffman(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len)
+{
+	const huffman_fast_entry_t *huffman_fast_table = get_huffman_fast_table();
 	size_t dst_pos = 0;
 	uint64_t bits = 0;
-	int nbits = 0;
-	size_t i;
+	int bits_avail = 0;
+	size_t i = 0;
 
-	for (i = 0; i < src_len; i++) {
-		if (nbits > 56) {
-			/* Bit buffer would overflow on next byte */
-			return -1;
+	while (i < src_len || bits_avail > 0) {
+		/* Refill bit buffer */
+		while (bits_avail <= 56 && i < src_len) {
+			bits = (bits << 8) | src[i++];
+			bits_avail += 8;
 		}
-		bits = (bits << 8) | src[i];
-		nbits += 8;
 
-		/* Try to decode symbols */
-		while (nbits >= 5) { /* Minimum code length is 5 bits */
+		if (bits_avail < HPACK_HUFFMAN_FAST_BITS) {
+			/* Not enough bits for the 12-bit fast lookup, but there may still be
+			 * valid short symbols (minimum code length is 5 bits).  Try a linear
+			 * scan over the table before giving up so that we don't misidentify
+			 * trailing symbol bits as padding and return -1.
+			 */
 			int found = 0;
-			int len;
-
-			/* Try different code lengths from longest to shortest for current bits */
-			for (len = (nbits > 30 ? 30 : nbits); len >= 5; len--) {
-				uint32_t code = (uint32_t)((bits >> (nbits - len)) & (((uint64_t)1 << len) - 1));
+			int try_len;
+			for (try_len = bits_avail; try_len >= 5; try_len--) {
+				uint32_t code = (uint32_t)((bits >> (bits_avail - try_len)) &
+				                           ((1ULL << try_len) - 1));
 				size_t j;
-
-				/* Search for matching code in table */
 				for (j = 0; j < HUFFMAN_TABLE_SIZE; j++) {
-					if (huffman_table[j].nbits == (uint8_t)len && huffman_table[j].bits == code) {
-						if (dst_pos >= dst_len) {
-							return -1;
-						}
-						dst[dst_pos++] = huffman_table[j].symbol;
-						nbits -= len;
-						bits &= (((uint64_t)1 << nbits) - 1); /* Clear decoded bits */
-						found = 1;
+					if (huffman_table[j].nbits != (uint8_t)try_len ||
+					    huffman_table[j].bits  != code)
+						continue;
+					if (huffman_table[j].symbol == 256) /* EOS – invalid mid-stream */
+						return -1;
+					if (dst_pos >= dst_len)
+						return -1;
+					dst[dst_pos++] = (uint8_t)huffman_table[j].symbol;
+					bits_avail -= try_len;
+					bits &= (bits_avail > 0) ? ((1ULL << bits_avail) - 1) : 0;
+					found = 1;
+					break;
+				}
+				if (found)
+					break;
+			}
+			if (!found)
+				break; /* Only padding bits remain */
+			continue;
+		}
+
+		/* Extract top 12 bits */
+		int shift = bits_avail - HPACK_HUFFMAN_FAST_BITS;
+		uint32_t key = (bits >> shift) & (HPACK_HUFFMAN_FAST_SIZE - 1);
+		const huffman_fast_entry_t *entry = &huffman_fast_table[key];
+
+		if (entry->need_more == 0) {
+			/* Normal symbol: decode in one shot */
+			if (entry->nbits > bits_avail)
+				return -1;
+			if (dst_pos >= dst_len)
+				return -1;
+			dst[dst_pos++] = (uint8_t)entry->symbol;
+			bits_avail -= entry->nbits;
+			bits &= ((uint64_t)1 << bits_avail) - 1;
+		} else {
+			/* Long code (length > 12 bits) – fallback to linear scan */
+			int consumed = hpack_decode_huffman_long(bits, bits_avail, dst, dst_len, &dst_pos);
+			if (consumed < 0) {
+				/* Check for valid padding at end */
+				if (i == src_len && bits_avail > 0 && bits_avail <= 7) {
+					uint32_t remaining = bits & ((1U << bits_avail) - 1);
+					if (remaining == ((1U << bits_avail) - 1)) {
+						/* Valid padding: end of stream */
 						break;
 					}
 				}
-
-				if (found) {
-					break;
-				}
+				return -1;
 			}
-
-			if (!found) {
-				/* No match found - might need more bits or it's padding */
-				if (i == src_len - 1) {
-					/* Last byte - remaining bits should be padding (all 1s) */
-					uint32_t padding_mask = (1U << nbits) - 1;
-					uint32_t remaining = (uint32_t)(bits & padding_mask);
-					if (remaining == padding_mask) {
-						/* Valid padding */
-						return dst_pos;
-					}
-				}
-				break; /* Need more bits */
-			}
+			bits_avail -= consumed;
+			bits &= ((uint64_t)1 << bits_avail) - 1;
 		}
 	}
 
+	/* After all bytes, ensure we have consumed all bits (padding already handled) */
+	if (bits_avail > 0) {
+		/* Only padding bits may remain, all must be 1's and no more than 7 bits */
+		uint32_t remaining = bits & ((1U << bits_avail) - 1);
+		if (remaining != ((1U << bits_avail) - 1))
+			return -1;
+	}
+
 	return dst_pos;
+}
+
+/* Get Huffman encoding table (function‑local static) */
+static const struct huffman_encoding_entry* get_huffman_encoding_table(void)
+{
+	static struct huffman_encoding_entry table[256];
+	static int initialized = 0;
+	if (initialized)
+		return table;
+
+	memset(table, 0, sizeof(table));
+	for (int i = 0; i < HUFFMAN_TABLE_SIZE; i++) {
+		uint16_t sym = huffman_table[i].symbol;
+		if (sym < 256) {
+			table[sym].code = huffman_table[i].bits;
+			table[sym].nbits = huffman_table[i].nbits;
+		}
+	}
+	initialized = 1;
+	return table;
 }
 
 static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
@@ -469,7 +640,7 @@ static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
 		/* Huffman decoding */
 
 		/* Allocate buffer for decoded string (worst case: same size as encoded) */
-		uint8_t *decoded = malloc(len * 2 + 1); /* Extra space for safety */
+		uint8_t *decoded = malloc(len * 2 + 1);
 		if (!decoded) {
 			return -1;
 		}
@@ -505,11 +676,108 @@ static int hpack_decode_string(const uint8_t *data, int data_len, char **str)
 	return offset;
 }
 
+/* Huffman encode a byte array, return number of bytes written to dst, or -1 */
+
+static int hpack_encode_huffman(const uint8_t *src, size_t src_len,
+                                uint8_t *dst, size_t dst_capacity)
+{
+	const struct huffman_encoding_entry *huffman_encoding_table = get_huffman_encoding_table();
+	uint64_t bits = 0;
+	int nbits = 0;
+	size_t dst_pos = 0;
+	size_t i;
+
+	for (i = 0; i < src_len; i++) {
+		uint8_t sym = src[i];
+		uint32_t code = huffman_encoding_table[sym].code;
+		uint8_t code_nbits = huffman_encoding_table[sym].nbits;
+
+		if (code_nbits == 0) {
+			/* Symbol not found in Huffman table, fallback to literal encoding */
+			return -1;
+		}
+
+		bits = (bits << code_nbits) | code;
+		nbits += code_nbits;
+
+		while (nbits >= 8) {
+			if (dst_pos >= dst_capacity)
+				return -1;
+			dst[dst_pos++] = (bits >> (nbits - 8)) & 0xFF;
+			nbits -= 8;
+		}
+	}
+
+	/* Final padding: add 1 bits to reach byte boundary (RFC 7541 5.2) */
+	if (nbits > 0) {
+		bits = (bits << (8 - nbits)) | ((1U << (8 - nbits)) - 1);
+		dst[dst_pos++] = bits & 0xFF;
+	}
+
+	return dst_pos;
+}
+
+/* HPACK string encoding/decoding */
+
+static int hpack_encode_string(const char *str, uint8_t *buf, int buf_size)
+{
+	int len = strlen(str);
+	int offset = 0;
+	int ret;
+	int use_huffman = 0;
+	uint8_t *huffman_buf = NULL;
+	int huffman_len = 0;
+
+	/* Try Huffman encoding first (if it reduces size) */
+	huffman_buf = malloc(len * 2 + 8);
+	if (huffman_buf) {
+		huffman_len = hpack_encode_huffman((const uint8_t *)str, len, huffman_buf, len * 2 + 8);
+		if (huffman_len > 0 && huffman_len < len) {
+			use_huffman = 1;
+		} else {
+			free(huffman_buf);
+			huffman_buf = NULL;
+		}
+	}
+
+	if (buf_size < 1) {
+		free(huffman_buf);
+		return -1;
+	}
+
+	/* Set Huffman flag */
+	buf[offset] = use_huffman ? 0x80 : 0x00;
+	int encode_len = use_huffman ? huffman_len : len;
+	ret = hpack_encode_integer(encode_len, 7, buf + offset, buf_size - offset);
+	if (ret < 0) {
+		free(huffman_buf);
+		return -1;
+	}
+	offset += ret;
+
+	if (offset + encode_len > buf_size) {
+		free(huffman_buf);
+		return -1;
+	}
+
+	if (use_huffman) {
+		memcpy(buf + offset, huffman_buf, huffman_len);
+		offset += huffman_len;
+		free(huffman_buf);
+	} else {
+		memcpy(buf + offset, str, len);
+		offset += len;
+	}
+
+	return offset;
+}
+
 /* HPACK dynamic table management */
 
 void hpack_init_context(struct hpack_context *hpack)
 {
 	hpack->dynamic_table = NULL;
+	hpack->dynamic_table_tail = NULL;
 	hpack->dynamic_table_size = 0;
 	hpack->max_dynamic_table_size = 65536; /* Default size */
 	hpack->entry_count = 0;
@@ -525,6 +793,7 @@ void hpack_free_context(struct hpack_context *hpack)
 		free(entry);
 		entry = next;
 	}
+	hpack->dynamic_table_tail = NULL;
 	hpack->dynamic_table = NULL;
 	hpack->dynamic_table_size = 0;
 	hpack->entry_count = 0;
@@ -537,18 +806,17 @@ static int hpack_add_dynamic_entry(struct hpack_context *hpack, const char *name
 
 	/* Evict entries if necessary */
 	while (hpack->dynamic_table_size + entry_size > hpack->max_dynamic_table_size && hpack->dynamic_table) {
-		struct hpack_dynamic_entry *last = hpack->dynamic_table;
-		struct hpack_dynamic_entry *prev = NULL;
-
-		while (last->next) {
-			prev = last;
-			last = last->next;
+		struct hpack_dynamic_entry *last = hpack->dynamic_table_tail;
+		if (!last) {
+			break;
 		}
 
-		if (prev) {
-			prev->next = NULL;
+		if (last->prev) {
+			last->prev->next = NULL;
+			hpack->dynamic_table_tail = last->prev;
 		} else {
 			hpack->dynamic_table = NULL;
+			hpack->dynamic_table_tail = NULL;
 		}
 
 		hpack->dynamic_table_size -= last->size;
@@ -573,7 +841,15 @@ static int hpack_add_dynamic_entry(struct hpack_context *hpack, const char *name
 	}
 
 	entry->size = entry_size;
+	entry->prev = NULL;
 	entry->next = hpack->dynamic_table;
+
+	if (hpack->dynamic_table) {
+		hpack->dynamic_table->prev = entry;
+	} else {
+		hpack->dynamic_table_tail = entry;
+	}
+
 	hpack->dynamic_table = entry;
 	hpack->dynamic_table_size += entry_size;
 	hpack->entry_count++;
@@ -728,18 +1004,17 @@ void hpack_resize_dynamic_table(struct hpack_context *hpack, size_t new_size)
 
 	/* Evict entries if necessary */
 	while (hpack->dynamic_table_size > hpack->max_dynamic_table_size && hpack->dynamic_table) {
-		struct hpack_dynamic_entry *last = hpack->dynamic_table;
-		struct hpack_dynamic_entry *prev = NULL;
-
-		while (last->next) {
-			prev = last;
-			last = last->next;
+		struct hpack_dynamic_entry *last = hpack->dynamic_table_tail;
+		if (!last) {
+			break;
 		}
 
-		if (prev) {
-			prev->next = NULL;
+		if (last->prev) {
+			last->prev->next = NULL;
+			hpack->dynamic_table_tail = last->prev;
 		} else {
 			hpack->dynamic_table = NULL;
+			hpack->dynamic_table_tail = NULL;
 		}
 
 		hpack->dynamic_table_size -= last->size;
