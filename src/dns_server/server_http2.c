@@ -76,7 +76,15 @@ int _dns_server_reply_http2(struct dns_request *request, struct dns_server_conn_
 
 	/* Send DNS response */
 	/* Content-Type for DoH is application/dns-message */
-	return _dns_server_http2_send_response(stream, 200, "application/dns-message", inpacket, inpacket_len);
+	int ret = _dns_server_http2_send_response(stream, 200, "application/dns-message", inpacket, inpacket_len);
+
+	/* Close HTTP/2 stream after sending response to prevent memory leak */
+	if (ret == 0) {
+		http2_stream_close(stream);
+		stream_conn->stream = NULL;
+	}
+
+	return ret;
 }
 
 static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *tls_client, struct http2_stream *stream)
@@ -90,29 +98,54 @@ static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *
 	}
 
 	if (strcasecmp(method, "POST") == 0) {
+		/* Prevent re-entry: if this stream has already been dispatched, ignore. */
+		if (http2_stream_get_ex_data(stream)) {
+			return;
+		}
+
+		/* Wait for remote end to finish sending request body */
 		if (!http2_stream_is_remote_end(stream)) {
 			return;
 		}
 
-		/* Read request body */
-		len = http2_stream_read_body(stream, buf, sizeof(buf));
-		if (len < 0) {
-			/* Error or no data yet */
-			if (http2_stream_is_end(stream)) {
+		uint8_t *body_buf = buf;
+		int total_len = 0;
+		int buf_size = sizeof(buf);
+
+		/* Read all DATA frames until END_STREAM */
+		while (!http2_stream_is_end(stream)) {
+			int chunk = http2_stream_read_body(stream, body_buf + total_len, buf_size - total_len);
+			if (chunk < 0) {
+				if (errno == EAGAIN) {
+					/* Wait for more data */
+					return;
+				}
+				/* Real error */
 				goto close_out;
 			}
-			return;
+			if (chunk == 0) {
+				/* No more data but stream not ended? Should not happen, break */
+				break;
+			}
+			total_len += chunk;
+			if (total_len >= buf_size) {
+				/* Request body too large for buffer */
+				_dns_server_http2_send_response(stream, 413, "text/plain", "Payload Too Large", 17);
+				goto close_out;
+			}
 		}
 
-		if (len == 0 && !http2_stream_is_end(stream)) {
-			/* No data available but stream not ended */
-			return;
-		}
-
-		if (!http2_stream_is_end(stream)) {
-			_dns_server_http2_send_response(stream, 413, "text/plain", "Payload Too Large", 17);
+		if (total_len == 0) {
+			/* Empty body, treat as bad request */
+			_dns_server_http2_send_response(stream, 400, "text/plain", "Bad Request", 11);
 			goto close_out;
 		}
+
+		/* Mark stream as dispatched to prevent a second poll delivery
+		 * (stream appears both in accept_stream and poll_items) from
+		 * re-entering this function and seeing total_len==0. */
+		http2_stream_set_ex_data(stream, (void *)1);
+		len = total_len;
 	} else if (strcasecmp(method, "GET") == 0) {
 		const char *path = http2_stream_get_path(stream);
 		char *base64_query = NULL;
@@ -159,6 +192,13 @@ static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *
 		}
 		free(query_val);
 
+		char *p = base64_query;
+		while (*p) {
+			if (*p == '-') *p = '+';
+			else if (*p == '_') *p = '/';
+			p++;
+		}
+
 		len = SSL_base64_decode_ext(base64_query, buf, sizeof(buf), 1, 1);
 		free(base64_query);
 
@@ -194,12 +234,8 @@ static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *
 
 		/* Process the packet */
 		/* Note: _dns_server_recv takes conn, inpacket, inpacket_len, local, local_len, from, from_len */
-		if (_dns_server_recv(&stream_conn->head, buf, len, &tls_client->tcp.localaddr, tls_client->tcp.localaddr_len,
-							 &tls_client->tcp.addr, tls_client->tcp.addr_len) != 0) {
-			_dns_server_http2_send_response(stream, 400, "text/plain", "Bad Request", 11);
-			_dns_server_conn_release(&stream_conn->head);
-			goto close_out;
-		}
+		_dns_server_recv(&stream_conn->head, buf, len, &tls_client->tcp.localaddr, tls_client->tcp.localaddr_len,
+						 &tls_client->tcp.addr, tls_client->tcp.addr_len);
 
 		/* Release our reference (request holds one now) */
 		_dns_server_conn_release(&stream_conn->head);
@@ -209,6 +245,17 @@ static void _dns_server_http2_process_stream(struct dns_server_conn_tls_client *
 
 close_out:
 	if (stream != NULL) {
+		struct http2_ctx *ctx = tls_client->http2_ctx;
+		if (ctx) {
+			int flush_retries = 0;
+			while (http2_ctx_want_write(ctx) && flush_retries < 10) {
+				if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+					break;
+				}
+				flush_retries++;
+			}
+		}
+
 		/* Close stream on error */
 		http2_stream_get(stream);
 		http2_stream_close(stream);
@@ -287,7 +334,7 @@ int _dns_server_process_http2(struct dns_server_conn_tls_client *tls_client, str
 			ret = http2_ctx_poll_readable(ctx, poll_items, sizeof(poll_items) / sizeof(poll_items[0]), &poll_count);
 			if (ret < 0) {
 				if (ret == HTTP2_ERR_EAGAIN) {
-					break;
+					goto update_epoll;
 				}
 				if (ret == HTTP2_ERR_EOF) {
 					/* Connection closed by peer */
@@ -299,21 +346,17 @@ int _dns_server_process_http2(struct dns_server_conn_tls_client *tls_client, str
 			}
 
 			if (poll_count == 0) {
-				break;
+				continue;
 			}
 
 			for (int i = 0; i < poll_count; i++) {
 				if (poll_items[i].stream == NULL) {
 					if (poll_items[i].readable) {
-						struct http2_stream *stream = NULL;
-						int accepted_count = 0;
-
-						while ((stream = http2_ctx_accept_stream(ctx)) != NULL) {
+						struct http2_stream *stream = http2_ctx_accept_stream(ctx);
+						if (stream) {
+							/* Accept and immediately process new HTTP/2 stream */
 							_dns_server_http2_process_stream(tls_client, stream);
 							http2_stream_put(stream);
-							if (++accepted_count >= DNS_SERVER_HTTP2_MAX_CONCURRENT_STREAMS) {
-								break;
-							}
 						}
 					}
 					continue;
