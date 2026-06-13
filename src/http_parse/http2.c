@@ -995,6 +995,10 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 
 	if (flags & HTTP2_FLAG_END_STREAM) {
 		stream->end_stream_received = 1;
+		/* If all data has already been read, mark end read handled immediately */
+		if (stream->body_read_offset >= stream->body_buffer_len) {
+			stream->end_stream_read_handled = 1;
+		}
 		if (stream->state == HTTP2_STREAM_OPEN)
 			stream->state = HTTP2_STREAM_HALF_CLOSED_REMOTE;
 		else if (stream->state == HTTP2_STREAM_HALF_CLOSED_LOCAL)
@@ -1776,12 +1780,19 @@ void http2_stream_put(struct http2_stream *stream)
 		return;
 	}
 
+	struct http2_ctx *ctx = stream->ctx;
+	if (ctx) {
+		pthread_mutex_lock(&ctx->mutex);
+	}
 	if (!list_empty(&stream->node)) {
 		_http2_remove_stream(stream, 0);
 	}
 	_http2_free_headers(stream);
 	free(stream->body_buffer);
 	free(stream);
+	if (ctx) {
+		pthread_mutex_unlock(&ctx->mutex);
+	}
 }
 
 static void _http2_ctx_init_common(struct http2_ctx *ctx, const struct http2_ctx_init_params *params)
