@@ -889,9 +889,6 @@ static int _http2_remove_stream(struct http2_stream *stream, int do_put)
 	}
 
 	ctx = stream->ctx;
-	if (ctx) {
-		pthread_mutex_lock(&ctx->mutex);
-	}
 
 	/* Try to remove from hash map */
 	if (!hlist_unhashed(&stream->hash_node)) {
@@ -905,18 +902,12 @@ static int _http2_remove_stream(struct http2_stream *stream, int do_put)
 		if (ctx) {
 			ctx->active_streams--;
 		}
-		
-		/* Only release ownership if we successfully removed it from the list.
-		   This prevents double-free if called concurrently or recursively. */
+
 		if (do_put) {
 			http2_stream_put(stream);
 		}
 	} else {
 		/* If already removed from list, we assume we don't own the list reference anymore */
-	}
-
-	if (ctx) {
-		pthread_mutex_unlock(&ctx->mutex);
 	}
 
 	return 0;
@@ -1261,7 +1252,7 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, const uint8_t *d
 			if (value > 1) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen + 1, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				return -1;
+				return HTTP2_ERR_PROTOCOL;
 			}
 			/* Server: ignore the setting (we don't support push) */
 			break;
