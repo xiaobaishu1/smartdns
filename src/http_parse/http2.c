@@ -1020,7 +1020,7 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 
 	int stream_inc = 0;
 	int conn_inc = 0;
-	if (stream->recv_window < ctx->local_recv_window_target / 2) {
+	if (stream->recv_window < ctx->local_recv_window_target / 3) {
 		stream_inc = ctx->local_recv_window_target - stream->recv_window;
 		/* Ensure window update does not exceed 2^31-1 as required by RFC 9113 */
 		if (stream_inc > INT_MAX - stream->recv_window) {
@@ -1030,7 +1030,7 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 			stream_inc = 0;
 		}
 	}
-	if (ctx->connection_recv_window < ctx->local_recv_window_target / 2) {
+	if (ctx->connection_recv_window < ctx->local_recv_window_target / 3) {
 		conn_inc = ctx->local_recv_window_target - ctx->connection_recv_window;
 		if (conn_inc > INT_MAX - ctx->connection_recv_window) {
 			conn_inc = INT_MAX - ctx->connection_recv_window;
@@ -1183,14 +1183,11 @@ static int _http2_process_headers_frame(struct http2_ctx *ctx, int stream_id, co
 		if (hpack_decode_headers(&ctx->decoder, ctx->header_block_buffer, ctx->header_block_len,
 		                         _http2_on_header, stream) < 0) {
 			/* RFC 9113 ss4.3: HPACK decompression failure is a connection
-			 * error (COMPRESSION_ERROR).  Also close the offending stream
 			 * to release its resources before returning the fatal error. */
 			http2_send_rst_stream(ctx, stream_id, HTTP2_RST_COMPRESSION_ERROR);
-			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen + 1, HTTP2_RST_COMPRESSION_ERROR, NULL, 0);
 			_http2_clear_continuation(ctx);
 			stream->state = HTTP2_STREAM_CLOSED;
 			_http2_remove_stream(stream, 1);
-			ctx->status = HTTP2_ERR_PROTOCOL;
 			return -1;
 		}
 	}
