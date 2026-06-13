@@ -234,6 +234,7 @@ struct dns_conn_stream {
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
 	dns_server_type_t type;
+	struct dns_server_buff resp_buff;  /* response body accumulator for HTTP/2 */
 };
 
 /* query struct */
