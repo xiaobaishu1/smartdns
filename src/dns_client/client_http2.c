@@ -166,11 +166,7 @@ static int _dns_client_send_http2_stream(struct dns_server_info *server_info, st
 	struct http2_header_pair headers[] = {{"content-type", "application/dns-message"},
 						{"accept", "application/dns-message"},
 						{"content-length", content_length},
-#ifdef WITH_ZLIB
-						{"accept-encoding", "gzip, deflate"},
-#else
 						{"accept-encoding", "identity"},
-#endif
 						{NULL, NULL}};
 
 	errno = 0;
