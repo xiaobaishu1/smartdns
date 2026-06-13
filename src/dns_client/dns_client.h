@@ -215,7 +215,7 @@ struct dns_client {
 	DECLARE_HASHTABLE(domain_map, 6);
 	DECLARE_HASHTABLE(group, 4);
 
-	atomic_t fd_wakeup;
+	int fd_wakeup;
 };
 
 /* dns replied server info */
