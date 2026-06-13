@@ -23,7 +23,6 @@
 #include "smartdns/dns_conf.h"
 #include "smartdns/dns_stats.h"
 #include "smartdns/http2.h"
-#include "smartdns/http3.h"
 #include "smartdns/lib/atomic.h"
 #include "smartdns/lib/hashtable.h"
 #include "smartdns/lib/list.h"
