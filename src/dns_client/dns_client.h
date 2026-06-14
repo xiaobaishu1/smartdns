@@ -134,7 +134,6 @@ struct dns_server_info {
 
 	/* HTTP/2 context - connection level, shared across requests */
 	struct http2_ctx *http2_ctx;
-	struct http3_ctx *http3_ctx;
 	char alpn_selected[32];
 
 	dns_server_security_status security_status;
@@ -214,7 +213,7 @@ struct dns_client {
 	DECLARE_HASHTABLE(domain_map, 6);
 	DECLARE_HASHTABLE(group, 4);
 
-	atomic_t fd_wakeup;
+	int fd_wakeup;
 };
 
 /* dns replied server info */
@@ -236,7 +235,6 @@ struct dns_conn_stream {
 	int recv_done;
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
-	struct http3_stream *http3_stream;
 	dns_server_type_t type;
 	struct dns_server_buff resp_buff;  /* response body accumulator for HTTP/2 */
 };
