@@ -39,12 +39,12 @@ extern "C" {
 
 #define DNS_MAX_HOSTNAME 256
 #define DNS_MAX_EVENTS 256
-#define DNS_HOSTNAME_LEN 128
+#define DNS_HOSTNAME_LEN 256
 #define DNS_TCP_BUFFER (32 * 1024)
 #define DNS_TCP_IDLE_TIMEOUT (60 * 10)
 #define DNS_TCP_CONNECT_TIMEOUT (5)
 #define DNS_QUERY_TIMEOUT (500)
-#define DNS_QUERY_RETRY (4)
+#define DNS_QUERY_RETRY (2)
 #define DNS_PENDING_SERVER_RETRY 60
 #define SOCKET_PRIORITY (6)
 #define SOCKET_IP_TOS (IPTOS_LOWDELAY | IPTOS_RELIABILITY)
@@ -134,6 +134,7 @@ struct dns_server_info {
 
 	/* HTTP/2 context - connection level, shared across requests */
 	struct http2_ctx *http2_ctx;
+	struct http3_ctx *http3_ctx;
 	char alpn_selected[32];
 
 	dns_server_security_status security_status;
@@ -160,6 +161,8 @@ struct dns_server_pending {
 	unsigned int query_v6;
 	unsigned int has_soa_v4;
 	unsigned int has_soa_v6;
+	unsigned int ipv4_failed;
+	unsigned int ipv6_failed;
 
 	/* server type */
 	dns_server_type_t type;
@@ -211,7 +214,7 @@ struct dns_client {
 	DECLARE_HASHTABLE(domain_map, 6);
 	DECLARE_HASHTABLE(group, 4);
 
-	int fd_wakeup;
+	atomic_t fd_wakeup;
 };
 
 /* dns replied server info */
@@ -233,7 +236,9 @@ struct dns_conn_stream {
 	int recv_done;
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
+	struct http3_stream *http3_stream;
 	dns_server_type_t type;
+	struct dns_server_buff resp_buff;  /* response body accumulator for HTTP/2 */
 };
 
 /* query struct */
