@@ -39,11 +39,11 @@ extern "C" {
 
 #define DNS_MAX_HOSTNAME 256
 #define DNS_MAX_EVENTS 256
-#define DNS_HOSTNAME_LEN 128
+#define DNS_HOSTNAME_LEN 256
 #define DNS_TCP_BUFFER (32 * 1024)
 #define DNS_TCP_IDLE_TIMEOUT (60 * 10)
 #define DNS_TCP_CONNECT_TIMEOUT (5)
-#define DNS_QUERY_TIMEOUT (500)
+#define DNS_QUERY_TIMEOUT (1000)
 #define DNS_QUERY_RETRY (4)
 #define DNS_PENDING_SERVER_RETRY 60
 #define SOCKET_PRIORITY (6)
@@ -160,6 +160,8 @@ struct dns_server_pending {
 	unsigned int query_v6;
 	unsigned int has_soa_v4;
 	unsigned int has_soa_v6;
+	unsigned int ipv4_failed;
+	unsigned int ipv6_failed;
 
 	/* server type */
 	dns_server_type_t type;
@@ -234,6 +236,7 @@ struct dns_conn_stream {
 	SSL *quic_stream;
 	struct http2_stream *http2_stream;
 	dns_server_type_t type;
+	struct dns_server_buff resp_buff;  /* response body accumulator for HTTP/2 */
 };
 
 /* query struct */
