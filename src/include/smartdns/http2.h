@@ -240,11 +240,13 @@ int http2_stream_set_response(struct http2_stream *stream, int status, const str
 							  int header_count);
 
 /**
- * Get HTTP method from request
- * @param stream Stream
- * @return Method string or NULL
+ * Get the HTTP method of the stream (for a request) into a caller-provided buffer.
+ * @param stream    HTTP/2 stream
+ * @param buf       Destination buffer
+ * @param buf_size  Size of destination buffer (must be > 0)
+ * @return length of the method on success, -1 on error, -2 if buffer too small
  */
-const char *http2_stream_get_method(struct http2_stream *stream);
+int http2_stream_get_method(struct http2_stream *stream, char *buf, size_t buf_size);
 
 /**
  * Get query parameter from request path
@@ -259,7 +261,7 @@ char *http2_stream_get_query_param(struct http2_stream *stream, const char *name
  * @param stream Stream
  * @return Path string or NULL
  */
-const char *http2_stream_get_path(struct http2_stream *stream);
+int http2_stream_get_path(struct http2_stream *stream, char *buf, size_t buf_size);
 
 /**
  * Get response status code
@@ -274,7 +276,7 @@ int http2_stream_get_status(struct http2_stream *stream);
  * @param name Header name
  * @return Header value or NULL if not found
  */
-const char *http2_stream_get_header(struct http2_stream *stream, const char *name);
+int http2_stream_get_header(struct http2_stream *stream, const char *name, char *buf, size_t buf_size);
 
 /**
  * Walk all headers in the stream
