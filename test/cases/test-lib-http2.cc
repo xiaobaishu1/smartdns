@@ -122,12 +122,19 @@ TEST_F(LIBHTTP2, Integrated)
 		uint8_t request_body[4096];
 		int request_body_len = 0;
 		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
-			int read_len = http2_stream_read_body(stream, request_body + request_body_len,
-												  sizeof(request_body) - request_body_len);
+			int read_len = http2_stream_read_body(stream, request_body + request_body_len, sizeof(request_body) - request_body_len);
+
+			if (read_len <= 0) {
+				// No data or would block – process incoming frames
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				usleep(1000);
+				if (read_len < 0 && errno != EAGAIN) {
+					break; // real error
+				}
+				continue;
+			}
 			if (read_len > 0) {
 				request_body_len += read_len;
-			} else {
-				usleep(10000);
 			}
 		}
 
@@ -427,12 +434,17 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		uint8_t request_body[4096];
 		int request_body_len = 0;
 		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
-			int read_len = http2_stream_read_body(stream, request_body + request_body_len,
-												  sizeof(request_body) - request_body_len);
+			int read_len = http2_stream_read_body(stream, request_body + request_body_len, sizeof(request_body) - request_body_len);
+			if (read_len <= 0) {
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				usleep(1000);
+				if (read_len < 0 && errno != EAGAIN) {
+					break;
+				}
+				continue;
+			}
 			if (read_len > 0) {
 				request_body_len += read_len;
-			} else {
-				usleep(10000);
 			}
 		}
 
