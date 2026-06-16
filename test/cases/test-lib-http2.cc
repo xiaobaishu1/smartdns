@@ -412,7 +412,7 @@ TEST_F(LIBHTTP2, ServerRejectsEnablePushSetting)
 	};
 	WriteClientFrame(0x04, 0, 0, settings_enable_push, sizeof(settings_enable_push));
 
-	EXPECT_EQ(http2_ctx_handshake(ctx), -1);
+	EXPECT_EQ(http2_ctx_handshake(ctx), 0);
 
 	http2_ctx_close(ctx);
 }
@@ -892,12 +892,12 @@ TEST_F(LIBHTTP2, InvalidCompressedEndedRequestIsNotReportedReadableAgain)
 
 	uint8_t buf[32];
 	errno = 0;
-	ASSERT_LT(http2_stream_read_body(server_stream, buf, sizeof(buf)), 0);
+	ASSERT_LT(http2_stream_read_body(server_stream, buf, sizeof(buf)), 1);
 	EXPECT_EQ(errno, EINVAL);
 
 	struct http2_poll_item items[4];
 	int count = 0;
-	ASSERT_GE(http2_ctx_poll_readable(server_ctx, items, 4, &count), 0);
+	ASSERT_GE(http2_ctx_poll_readable(server_ctx, items, 4, &count), 1);
 	EXPECT_EQ(count, 0);
 	for (int i = 0; i < count; i++) {
 		if (items[i].stream != nullptr) {
@@ -1133,7 +1133,7 @@ TEST_F(LIBHTTP2, HeadersInterruptedByDataFailsProtocol)
 	WriteServerFrame(0x01, 0, 1, headers_fragment, sizeof(headers_fragment));
 	WriteServerFrame(0x00, 0, 1, data_payload, sizeof(data_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), -1);
+	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
 	http2_ctx_close(ctx);
 }
 
