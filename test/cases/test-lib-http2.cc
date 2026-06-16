@@ -140,7 +140,13 @@ TEST_F(LIBHTTP2, Integrated)
 		http2_stream_set_response(stream, 200, headers, 2);
 		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
 
-		http2_ctx_poll(ctx, NULL, 0, NULL);
+		int flush_retries = 100;
+		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(1000);
+		}
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -439,7 +445,13 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 		http2_stream_set_response(stream, 200, headers, 2);
 		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
-		http2_ctx_poll(ctx, NULL, 0, NULL);
+		int flush_retries = 100;
+		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(1000);
+		}
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -681,6 +693,13 @@ TEST_F(LIBHTTP2, StreamClose)
 		http2_stream_set_response(stream, 200, NULL, 0);
 		http2_stream_write_body(stream, (const uint8_t *)"OK", 2, 1);
 
+		int flush_retries = 100;
+		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(1000);
+		}
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
