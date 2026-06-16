@@ -284,8 +284,11 @@ TEST_F(LIBHTTP2, HpackDynamicTableSharedAcrossInterleavedStreams)
 
 	ASSERT_NE(stream1, nullptr);
 	ASSERT_NE(stream3, nullptr);
-	EXPECT_STREQ(http2_stream_get_header(stream1, "x-hpack-sync"), "dynamic-value");
-	EXPECT_STREQ(http2_stream_get_header(stream3, "x-hpack-sync"), "dynamic-value");
+	char header_value[256];
+	EXPECT_GE(http2_stream_get_header(stream1, "x-hpack-sync", header_value, sizeof(header_value)), 0);
+	EXPECT_STREQ(header_value, "dynamic-value");
+	EXPECT_GE(http2_stream_get_header(stream3, "x-hpack-sync", header_value, sizeof(header_value)), 0);
+	EXPECT_STREQ(header_value, "dynamic-value");
 	EXPECT_FALSE(http2_ctx_is_closed(ctx));
 
 	http2_stream_close(stream3);
@@ -1015,8 +1018,11 @@ TEST_F(LIBHTTP2, RequestHostHeaderOverridesAuthority)
 	}
 
 	ASSERT_NE(server_stream, nullptr);
-	EXPECT_STREQ(http2_stream_get_header(server_stream, ":authority"), "cloudflare-dns.com");
-	EXPECT_EQ(http2_stream_get_header(server_stream, "host"), nullptr);
+	char authority_value[256];
+	EXPECT_GE(http2_stream_get_header(server_stream, ":authority", authority_value, sizeof(authority_value)), 0);
+	EXPECT_STREQ(authority_value, "cloudflare-dns.com");
+	char host_value[256];
+	EXPECT_LT(http2_stream_get_header(server_stream, "host", host_value, sizeof(host_value)), 0);
 
 	http2_stream_close(server_stream);
 	http2_stream_close(client_stream);
@@ -1378,7 +1384,9 @@ TEST_F(LIBHTTP2, RefusedHeadersStillUpdateHpackDecoder)
 	}
 
 	ASSERT_NE(accepted_server_stream, nullptr);
-	EXPECT_STREQ(http2_stream_get_header(accepted_server_stream, "x-hpack-sync"), "dynamic-value");
+	char header_value[256];
+	EXPECT_GE(http2_stream_get_header(accepted_server_stream, "x-hpack-sync", header_value, sizeof(header_value)), 0);
+	EXPECT_STREQ(header_value, "dynamic-value");
 	EXPECT_FALSE(http2_ctx_is_closed(server_ctx));
 
 	http2_stream_close(accepted_server_stream);
@@ -1592,10 +1600,12 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
 
 		// Verify we received the request
-		const char *method = http2_stream_get_method(stream);
-		const char *path = http2_stream_get_path(stream);
-		EXPECT_STREQ(method, "POST");
-		EXPECT_STREQ(path, "/early-test");
+		char method_buf[32];
+		char path_buf[256];
+		EXPECT_GE(http2_stream_get_method(stream, method_buf, sizeof(method_buf)), 0);
+		EXPECT_GE(http2_stream_get_path(stream, path_buf, sizeof(path_buf)), 0);
+		EXPECT_STREQ(method_buf, "POST");
+		EXPECT_STREQ(path_buf, "/early-test");
 
 		// Read request body (should be empty for GET)
 		uint8_t request_body[4096];
