@@ -16,337 +16,283 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _HTTP2_H_
-#define _HTTP2_H_
+#ifndef _DNS_CLIENT_H_
+#define _DNS_CLIENT_H_
 
-#include <stddef.h>
-#include <stdint.h>
+#include "smartdns/dns.h"
+#include "smartdns/dns_conf.h"
+#include "smartdns/dns_stats.h"
+#include "smartdns/http2.h"
+#include "smartdns/lib/atomic.h"
+#include "smartdns/lib/hashtable.h"
+#include "smartdns/lib/list.h"
+#include "smartdns/tlog.h"
+
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 #ifdef __cplusplus
 extern "C" {
-#endif
+#endif /*__cplusplus */
 
-/* Opaque structures */
-struct http2_ctx;
-struct http2_stream;
+#define DNS_MAX_HOSTNAME 256
+#define DNS_MAX_EVENTS 256
+#define DNS_HOSTNAME_LEN 256
+#define DNS_TCP_BUFFER (32 * 1024)
+#define DNS_TCP_IDLE_TIMEOUT (60 * 10)
+#define DNS_TCP_CONNECT_TIMEOUT (5)
+#define DNS_QUERY_TIMEOUT (500)
+#define DNS_QUERY_RETRY (2)
+#define DNS_PENDING_SERVER_RETRY 60
+#define SOCKET_PRIORITY (6)
+#define SOCKET_IP_TOS (IPTOS_LOWDELAY | IPTOS_RELIABILITY)
 
-/* HTTP/2 Settings structure */
-struct http2_settings {
-	int max_concurrent_streams; /* -1 = use default (8192), 0 = unlimited */
+/* ECS info */
+struct dns_client_ecs {
+	int enable;
+	struct dns_opt_ecs ecs;
 };
 
-/* Error codes */
-enum {
-	HTTP2_ERR_NONE = 0,
-	HTTP2_ERR_EAGAIN = -1,
-	HTTP2_ERR_EOF = -2,
-	HTTP2_ERR_IO = -3,
-	HTTP2_ERR_PROTOCOL = -4,
-	HTTP2_ERR_HTTP1 = -5,
+/* TCP/TLS buffer */
+struct dns_server_buff {
+	unsigned char data[DNS_TCP_BUFFER];
+	int len;
 };
 
-/* Convert error code to string */
-const char *http2_error_to_string(int ret);
+typedef enum dns_server_status {
+	DNS_SERVER_STATUS_INIT = 0,
+	DNS_SERVER_STATUS_CONNECTING,
+	DNS_SERVER_STATUS_CONNECTIONLESS,
+	DNS_SERVER_STATUS_CONNECTED,
+	DNS_SERVER_STATUS_DISCONNECTED,
+} dns_server_status;
 
-/* BIO callback types */
-typedef int (*http2_bio_read_fn)(void *private_data, uint8_t *buf, int len);
-typedef int (*http2_bio_write_fn)(void *private_data, const uint8_t *buf, int len);
+/* dns server information */
+struct dns_server_info {
+	atomic_t refcnt;
+	struct list_head list;
+	struct list_head check_list;
+	/* server ping handle */
+	struct ping_host_struct *ping_host;
 
-/* Poll item for checking stream readiness */
-struct http2_poll_item {
-	struct http2_stream *stream;
-	int readable; /* 1 if stream has data to read, 0 otherwise */
-	int writable; /* 1 if stream can accept writes, 0 otherwise */
+	char host[DNS_HOSTNAME_LEN];
+	char ip[DNS_MAX_HOSTNAME];
+	int port;
+	char proxy_name[DNS_HOSTNAME_LEN];
+	/* server type */
+	dns_server_type_t type;
+	long long so_mark;
+	int drop_packet_latency_ms;
+
+	/* client socket */
+	int fd;
+	int ttl;
+	int ttl_range;
+	SSL *ssl;
+	int ssl_write_len;
+	int ssl_want_write;
+	SSL_CTX *ssl_ctx;
+	SSL_SESSION *ssl_session;
+	BIO_METHOD *bio_method;
+
+	struct proxy_conn *proxy;
+
+	pthread_mutex_t lock;
+	char skip_check_cert;
+	dns_server_status status;
+
+	struct dns_server_buff send_buff;
+	struct dns_server_buff recv_buff;
+
+	time_t last_send;
+	time_t last_recv;
+	unsigned long send_tick;
+	int prohibit;
+	atomic_t is_alive;
+	int is_already_prohibit;
+
+	/* server addr info */
+	unsigned short ai_family;
+
+	socklen_t ai_addrlen;
+	union {
+		struct sockaddr_in in;
+		struct sockaddr_in6 in6;
+		struct sockaddr addr;
+	};
+
+	struct client_dns_server_flags flags;
+
+	/* ECS */
+	struct dns_client_ecs ecs_ipv4;
+	struct dns_client_ecs ecs_ipv6;
+
+	struct dns_server_stats stats;
+	struct list_head conn_stream_list;
+
+	/* HTTP/2 context - connection level, shared across requests */
+	struct http2_ctx *http2_ctx;
+	char alpn_selected[32];
+
+	dns_server_security_status security_status;
 };
 
-/* Connection Lifecycle APIs */
-
-/**
- * Create a new HTTP/2 client context
- * @param server Server name (for debugging/logging)
- * @param bio_read Read callback function
- * @param bio_write Write callback function
- * @param private_data User data passed to BIO callbacks
- * @param settings HTTP/2 settings to use (NULL for defaults)
- * @return New context or NULL on error
- */
-struct http2_ctx *http2_ctx_client_new(const char *server, http2_bio_read_fn bio_read, http2_bio_write_fn bio_write,
-									   void *private_data, const struct http2_settings *settings);
-
-/**
- * Create a new HTTP/2 server context
- * @param server Server name (for debugging/logging)
- * @param bio_read Read callback function
- * @param bio_write Write callback function
- * @param private_data User data passed to BIO callbacks
- * @param settings HTTP/2 settings to use (NULL for defaults)
- * @return New context or NULL on error
- */
-struct http2_ctx *http2_ctx_server_new(const char *server, http2_bio_read_fn bio_read, http2_bio_write_fn bio_write,
-									   void *private_data, const struct http2_settings *settings);
-
-/**
- * Close an HTTP/2 context, release all streams and release ownership.
- * This is used to break circular references between context and streams
- * @param ctx Context to close
- */
-void http2_ctx_close(struct http2_ctx *ctx);
-
-/**
- * Increase reference count of HTTP/2 context
- * @param ctx HTTP/2 context
- * @return The same context pointer
- */
-struct http2_ctx *http2_ctx_get(struct http2_ctx *ctx);
-
-/**
- * Decrease reference count of HTTP/2 context
- * Frees the context when reference count reaches zero
- * @param ctx HTTP/2 context
- */
-void http2_ctx_put(struct http2_ctx *ctx);
-
-/**
- * Perform HTTP/2 handshake (SETTINGS exchange)
- * @param ctx HTTP/2 context
- * @return 1 if handshake complete, 0 if in progress, -1 on error
- */
-int http2_ctx_handshake(struct http2_ctx *ctx);
-
-/**
- * Server: Accept an incoming stream
- * @param ctx HTTP/2 context
- * @return New stream or NULL if no stream available
- */
-struct http2_stream *http2_ctx_accept_stream(struct http2_ctx *ctx);
-
-/**
- * Poll streams for readiness
- * @param ctx HTTP/2 context
- * @param items Array to fill with poll results
- * @param max_items Maximum number of items to return
- * @param ret_count Output: number of items returned
- * @return 0 on success, HTTP2_ERR_* on error
- *
- * Streams returned in items hold a reference for the caller. Release each
- * non-NULL stream with http2_stream_put() after processing.
- */
-int http2_ctx_poll(struct http2_ctx *ctx, struct http2_poll_item *items, int max_items, int *ret_count);
-
-/**
- * Poll streams for readiness (only readable streams)
- * @param ctx HTTP/2 context
- * @param items Array to fill with poll results
- * @param max_items Maximum number of items to return
- * @param ret_count Output: number of items returned
- * @return 0 on success, HTTP2_ERR_* on error
- *
- * Streams returned in items hold a reference for the caller. Release each
- * non-NULL stream with http2_stream_put() after processing.
- */
-int http2_ctx_poll_readable(struct http2_ctx *ctx, struct http2_poll_item *items, int max_items, int *ret_count);
-
-/**
- * Check if context wants to read (EAGAIN on last read)
- * @param ctx HTTP/2 context
- * @return 1 if wants read, 0 otherwise
- */
-int http2_ctx_want_read(struct http2_ctx *ctx);
-
-/**
- * Check if context wants to write (has pending buffered writes)
- * @param ctx HTTP/2 context
- * @return 1 if wants write, 0 otherwise
- */
-int http2_ctx_want_write(struct http2_ctx *ctx);
-
-/**
- * Check if connection is closed or has encountered an error
- * @param ctx HTTP/2 context
- * @return 1 if connection is closed/errored, 0 if still active
- */
-int http2_ctx_is_closed(struct http2_ctx *ctx);
-
-/* Stream Management APIs */
-
-/**
- * Client: Create a new stream
- * @param ctx HTTP/2 context
- * @return New stream or NULL on error
- */
-struct http2_stream *http2_stream_new(struct http2_ctx *ctx);
-
-/**
- * Free a stream
- * @param stream Stream to free
- */
-
-/**
- * Close a stream and release ownership
- * @param stream Stream to close
- */
-void http2_stream_close(struct http2_stream *stream);
-
-/**
- * Increase reference count of stream
- * @param stream Stream
- * @return The same stream pointer
- */
-struct http2_stream *http2_stream_get(struct http2_stream *stream);
-
-/**
- * Decrease reference count of stream
- * Frees the stream when reference count reaches zero
- * @param stream Stream
- */
-void http2_stream_put(struct http2_stream *stream);
-
-/**
- * Get stream ID
- * @param stream Stream
- * @return Stream ID or -1 on error
- */
-int http2_stream_get_id(struct http2_stream *stream);
-
-/* Header name-value pair for building header lists */
-struct http2_header_pair {
-	const char *name;
-	const char *value;
+struct dns_server_pending_group {
+	struct list_head list;
+	char group_name[DNS_GROUP_NAME_LEN];
 };
 
-/* Stream Header APIs */
+struct dns_server_pending {
+	struct list_head list;
+	struct list_head retry_list;
+	atomic_t refcnt;
 
-/**
- * Client: Set request headers
- * @param stream Stream
- * @param method HTTP method (e.g., "GET", "POST")
- * @param path Request path
- * @param scheme Scheme (e.g., "https"), if NULL defaults to "https"
- * @param headers Array of additional headers (NULL-terminated, last element must have name=NULL)
- * @return 0 on success, -1 on error
- */
-int http2_stream_set_request(struct http2_stream *stream, const char *method, const char *path,
-							 const char *scheme, const struct http2_header_pair *headers);
+	char host[DNS_HOSTNAME_LEN];
+	char ipv4[DNS_HOSTNAME_LEN];
+	char ipv6[DNS_HOSTNAME_LEN];
+	unsigned int ping_time_v6;
+	unsigned int ping_time_v4;
+	unsigned int has_v4;
+	unsigned int has_v6;
+	unsigned int query_v4;
+	unsigned int query_v6;
+	unsigned int has_soa_v4;
+	unsigned int has_soa_v6;
+	unsigned int ipv4_failed;
+	unsigned int ipv6_failed;
 
-/**
- * Server: Set response headers
- * @param stream Stream
- * @param status HTTP status code (e.g., 200, 404)
- * @param headers Array of additional headers
- * @param header_count Number of headers in the array
- * @return 0 on success, -1 on error
- */
-int http2_stream_set_response(struct http2_stream *stream, int status, const struct http2_header_pair *headers,
-							  int header_count);
+	/* server type */
+	dns_server_type_t type;
+	int retry_cnt;
 
-/**
- * Get the HTTP method of the stream (for a request) into a caller-provided buffer.
- * @param stream    HTTP/2 stream
- * @param buf       Destination buffer
- * @param buf_size  Size of destination buffer (must be > 0)
- * @return length of the method on success, -1 on error, -2 if buffer too small
- */
-int http2_stream_get_method(struct http2_stream *stream, char *buf, size_t buf_size);
+	int port;
 
-/**
- * Get query parameter from request path
- * @param stream Stream
- * @param name Parameter name
- * @return Parameter value (must be freed by caller) or NULL if not found
- */
-char *http2_stream_get_query_param(struct http2_stream *stream, const char *name);
+	struct client_dns_server_flags flags;
 
-/**
- * Get request path
- * @param stream Stream
- * @return Path string or NULL
- */
-int http2_stream_get_path(struct http2_stream *stream, char *buf, size_t buf_size);
+	struct list_head group_list;
+};
 
-/**
- * Get response status code
- * @param stream Stream
- * @return Status code or -1 if not set
- */
-int http2_stream_get_status(struct http2_stream *stream);
+/* upstream server group member */
+struct dns_server_group_member {
+	struct list_head list;
+	struct dns_server_info *server;
+};
 
-/**
- * Get header value by name
- * @param stream Stream
- * @param name Header name
- * @return Header value or NULL if not found
- */
-int http2_stream_get_header(struct http2_stream *stream, const char *name, char *buf, size_t buf_size);
+/* upstream server groups */
+struct dns_server_group {
+	char group_name[DNS_GROUP_NAME_LEN];
+	struct hlist_node node;
+	struct list_head head;
+};
 
-/**
- * Walk all headers in the stream
- * @param stream Stream
- * @param fn Callback function to call for each header
- * @param arg User data passed to callback
- */
-typedef void (*header_walk_fn)(void *arg, const char *name, const char *value);
-void http2_stream_headers_walk(struct http2_stream *stream, header_walk_fn fn, void *arg);
+/* dns client */
+struct dns_client {
+	pthread_t tid;
+	atomic_t run;
+	int epoll_fd;
 
-/* Stream Body APIs */
+	/* dns server list */
+	pthread_mutex_t server_list_lock;
+	struct list_head dns_server_list;
+	struct dns_server_group *default_group;
 
-/**
- * Write body data to stream
- * @param stream Stream
- * @param data Data to write
- * @param len Length of data
- * @param end_stream 1 to mark end of stream, 0 otherwise
- * @return Number of bytes written or -1 on error
- */
-int http2_stream_write_body(struct http2_stream *stream, const uint8_t *data, int len, int end_stream);
+	SSL_CTX *ssl_ctx;
+	SSL_CTX *ssl_quic_ctx;
+	int ssl_verify_skip;
 
-/**
- * Read body data from stream
- * @param stream Stream
- * @param data Buffer to read into
- * @param len Maximum length to read
- * @return Number of bytes read, 0 if no data available, -1 on error
- */
-int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len);
+	/* query list */
+	struct list_head dns_request_list;
+	atomic_t run_period;
+	atomic_t dns_server_num;
+	atomic_t dns_server_prohibit_num;
 
-/**
- * Check if body data is available to read
- * @param stream Stream
- * @return 1 if data available, 0 otherwise
- */
-int http2_stream_body_available(struct http2_stream *stream);
+	/* query domain hash table, key: sid + domain */
+	pthread_mutex_t domain_map_lock;
+	DECLARE_HASHTABLE(domain_map, 6);
+	DECLARE_HASHTABLE(group, 4);
 
-/**
- * Check if stream has ended
- * @param stream Stream
- * @return 1 if stream ended, 0 otherwise
- */
-int http2_stream_is_end(struct http2_stream *stream);
+	int fd_wakeup;
+};
 
-/**
- * Check if peer has ended its side of the stream
- * @param stream Stream
- * @return 1 if peer sent END_STREAM or stream/connection is closed, 0 otherwise
- */
-int http2_stream_is_remote_end(struct http2_stream *stream);
+/* dns replied server info */
+struct dns_query_replied {
+	struct hlist_node node;
+	struct dns_server_info *server;
+};
 
-/* Stream Metadata APIs */
+struct dns_conn_stream {
+	atomic_t refcnt;
+	struct list_head query_list;
+	struct list_head server_list;
+	struct dns_server_buff send_buff;
+	struct dns_server_buff recv_buff;
 
-/**
- * Set user data on stream
- * @param stream Stream
- * @param data User data pointer
- */
-void http2_stream_set_ex_data(struct http2_stream *stream, void *data);
+	struct dns_query_struct *query;
+	struct dns_server_info *server_info;
 
-/**
- * Get user data from stream
- * @param stream Stream
- * @return User data pointer or NULL
- */
-void *http2_stream_get_ex_data(struct http2_stream *stream);
+	int recv_done;
+	SSL *quic_stream;
+	struct http2_stream *http2_stream;
+	dns_server_type_t type;
+	struct dns_server_buff resp_buff;  /* response body accumulator for HTTP/2 */
+};
+
+/* query struct */
+struct dns_query_struct {
+	struct list_head dns_request_list;
+	atomic_t refcnt;
+	struct dns_server_group *server_group;
+
+	struct dns_conf_group *conf;
+
+	struct list_head conn_stream_list;
+
+	/* query id, hash key sid + domain*/
+	char domain[DNS_MAX_CNAME_LEN];
+	unsigned short sid;
+	struct hlist_node domain_node;
+
+	struct list_head period_list;
+
+	/* dns query type */
+	int qtype;
+
+	/* dns query number */
+	atomic_t dns_request_sent;
+	unsigned long send_tick;
+
+	/* caller notification */
+	dns_client_callback callback;
+	void *user_ptr;
+
+	/* retry count */
+	atomic_t retry_count;
+
+	/* has result */
+	int has_result;
+
+	/* ECS */
+	struct dns_client_ecs ecs;
+
+	/* EDNS0_DO */
+	int edns0_do;
+
+	/* replied hash table */
+	DECLARE_HASHTABLE(replied_map, 4);
+
+	pthread_mutex_t lock;
+};
+
+extern struct dns_client client;
+
+int _dns_client_recv(struct dns_server_info *server_info, unsigned char *inpacket, int inpacket_len,
+					 struct sockaddr *from, socklen_t from_len);
+
+int _dns_client_send_packet(struct dns_query_struct *query, void *packet, int len);
 
 #ifdef __cplusplus
 }
+#endif /*__cplusplus */
 #endif
-
-#endif /* _HTTP2_H_ */
