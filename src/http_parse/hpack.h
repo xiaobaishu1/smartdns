@@ -13,15 +13,18 @@ struct hpack_dynamic_entry {
 	char *name;
 	char *value;
 	size_t size; /* name_len + value_len + 32 */
+	struct hpack_dynamic_entry *prev;
 	struct hpack_dynamic_entry *next;
 };
 
 /* HPACK context */
 struct hpack_context {
 	struct hpack_dynamic_entry *dynamic_table;
+	struct hpack_dynamic_entry *dynamic_table_tail;
 	size_t dynamic_table_size;
 	size_t max_dynamic_table_size;
 	int entry_count;
+	uint32_t last_sent_table_size;  /* last dynamic table size sent to peer */
 };
 
 /* Callback function for decoded headers */
@@ -68,6 +71,16 @@ int hpack_encode_header(struct hpack_context *hpack, const char *name, const cha
  */
 int hpack_decode_headers(struct hpack_context *hpack, const uint8_t *data, int data_len, hpack_on_header_fn on_header,
 						 void *ctx);
+
+/**
+ * Decode a Huffman‑encoded string (RFC 7541)
+ * @param src Input Huffman data
+ * @param src_len Input length
+ * @param dst Output buffer for decoded string
+ * @param dst_len Output buffer capacity
+ * @return Number of decoded bytes, or -1 on error
+ */
+int hpack_decode_huffman(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len);
 
 #ifdef __cplusplus
 }
