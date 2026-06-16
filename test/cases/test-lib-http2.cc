@@ -140,6 +140,7 @@ TEST_F(LIBHTTP2, Integrated)
 		http2_stream_set_response(stream, 200, headers, 2);
 		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
 
+		http2_ctx_poll(ctx, NULL, 0, NULL);
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -406,10 +407,15 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
 
 		// Verify we received the request
-		const char *method = http2_stream_get_method(stream);
-		const char *path = http2_stream_get_path(stream);
-		EXPECT_STREQ(method, "POST");
-		EXPECT_STREQ(path, "/early-test");
+		char method_buf[64] = {0};
+		char path_buf[256] = {0};
+		if (http2_stream_get_method(stream, method_buf, sizeof(method_buf)) >= 0 &&
+		    http2_stream_get_path(stream, path_buf, sizeof(path_buf)) >= 0) {
+			EXPECT_STREQ(method_buf, "POST");
+			EXPECT_STREQ(path_buf, "/early-test");
+		} else {
+			FAIL() << "Failed to get method or path";
+		}
 
 		// Read request body (should be empty for GET)
 		uint8_t request_body[4096];
@@ -433,6 +439,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 		http2_stream_set_response(stream, 200, headers, 2);
 		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
+		http2_ctx_poll(ctx, NULL, 0, NULL);
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
