@@ -1562,14 +1562,14 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
 			ctx->want_write = 1;  /* force flush GOAWAY */
-			return HTTP2_ERR_PROTOCOL;
+			return -1;
 		}
 
 		/* Check continuation state */
 		if (ctx->continuation_active && type != HTTP2_FRAME_CONTINUATION) {
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
-			return HTTP2_ERR_PROTOCOL;
+			return -1;
 		}
 
 		/* Read frame payload */
@@ -2769,7 +2769,8 @@ int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len)
 	}
 
 	int available = stream->body_buffer_len - stream->body_read_offset;
-	if (available <= 0) {
+		int need_unlock = (ctx != NULL);
+		if (need_unlock) {
 		if (ctx) {
 			pthread_mutex_unlock(&ctx->mutex);
 		}
@@ -2788,6 +2789,14 @@ int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len)
 	int to_read = available < len ? available : len;
 	memcpy(data, stream->body_buffer + stream->body_read_offset, to_read);
 	stream->body_read_offset += to_read;
+	available -= to_read;
+
+	/* If we just consumed the last byte and the stream has ended,
+	 * mark EOF as handled so poll won't report this stream as readable again. */
+	if (available == 0 && (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED ||
+	                       (!ctx || ctx->status < 0))) {
+		stream->end_stream_read_handled = 1;
+	}
 
 	if (ctx) {
 		pthread_mutex_unlock(&ctx->mutex);
