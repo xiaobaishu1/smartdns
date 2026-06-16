@@ -326,7 +326,30 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		int ret = http2_stream_set_request(stream, "POST", "/early-test", NULL, headers);
 		EXPECT_EQ(ret, 0) << "Failed to set request";
 		const char *request_body = "test echo";
-		http2_stream_write_body(stream, (const uint8_t *)request_body, strlen(request_body), 1);
+		int body_len = strlen(request_body);
+		int sent = 0;
+		while (sent < body_len) {
+			int ret = http2_stream_write_body(stream,
+			                                   (const uint8_t *)request_body + sent,
+			                                   body_len - sent,
+			                                   (sent + (body_len - sent) == body_len) ? 1 : 0);
+			if (ret < 0) {
+				if (errno == EAGAIN) {
+					http2_ctx_poll(ctx, NULL, 0, NULL);
+					usleep(1000);
+					continue;
+				}
+				FAIL() << "write body failed";
+			}
+			sent += ret;
+			// If ret == 0, it means no bytes sent (should not happen with len>0), but avoid infinite loop
+			if (ret == 0) {
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				usleep(1000);
+			}
+		}
+		// Ensure end_stream is sent if not already
+		if (sent < body_len) { /* handled above */ }
 
 		// Now complete handshake
 		int handshake_attempts = 200;
@@ -892,7 +915,30 @@ TEST_F(LIBHTTP2, StressTest)
 				{NULL, NULL}
 			};
 			http2_stream_set_request(stream, "POST", path, NULL, headers);
-			http2_stream_write_body(stream, (const uint8_t *)body, body_len, 1);
+			int sent = 0;
+			while (sent < body_len) {
+				int ret = http2_stream_write_body(stream,
+				                                   (const uint8_t *)body + sent,
+				                                   body_len - sent,
+				                                   (sent + (body_len - sent) == body_len) ? 1 : 0);
+				if (ret < 0) {
+					if (errno == EAGAIN) {
+						http2_ctx_poll(ctx, NULL, 0, NULL);
+						usleep(1000);
+						continue;
+					}
+					FAIL() << "write body failed";
+				}
+				sent += ret;
+				if (ret == 0) {
+					http2_ctx_poll(ctx, NULL, 0, NULL);
+					usleep(1000);
+				}
+			}
+			// Ensure end_stream flag is sent
+			if (sent == body_len) {
+				// end_stream was already set in the last call
+			}
 			if ((i+1) % 10 == 0) process_events(0);
 		}
 
