@@ -952,14 +952,18 @@ static int _http2_process_data_frame(struct http2_ctx *ctx, int stream_id, const
 
 	struct http2_stream *stream = _http2_find_stream(ctx, stream_id);
 	if (!stream) {
-		return -1;
+		_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
+		ctx->status = HTTP2_ERR_PROTOCOL;
+		return HTTP2_ERR_PROTOCOL;
 	}
 
-	/* Stream is already closed or half-closed remote, reject further DATA */
+	/* Stream is already closed or half-closed remote: receiving DATA is a connection error
+	 * because the peer should not send DATA after END_STREAM (RFC 9113 §5.1). */
 	if (stream->end_stream_received || stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE ||
 	    stream->state == HTTP2_STREAM_CLOSED) {
-		http2_send_rst_stream(ctx, stream_id, HTTP2_RST_STREAM_CLOSED);
-		return 0; /* stream error only; connection continues */
+		_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
+		ctx->status = HTTP2_ERR_PROTOCOL;
+		return HTTP2_ERR_PROTOCOL;
 	}
 
 	if (len < 0) {
@@ -2769,20 +2773,22 @@ int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len)
 	}
 
 	int available = stream->body_buffer_len - stream->body_read_offset;
-	int stream_ended = (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED ||
-	                    (!ctx || ctx->status < 0));
-	if (available <= 0 && !stream_ended) {
-		if (ctx) {
-			pthread_mutex_unlock(&ctx->mutex);
-		}
+	int stream_ended = (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED);
+	if (!stream_ended && ctx && ctx->status < 0) {
+		stream_ended = 1;
+	}
 
-		/* If stream ended or connection has error, return 0 (EOF) */
-		if (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED || (!ctx || ctx->status < 0)) {
+	if (available <= 0) {
+		int need_unlock = (ctx != NULL);
+		if (stream_ended) {
+			if (ctx)
+				pthread_mutex_unlock(&ctx->mutex);
 			stream->end_stream_read_handled = 1;
 			return 0;
 		}
-
-		/* No data available yet, return EAGAIN */
+		/* No data and stream not ended: try again later */
+		if (ctx)
+			pthread_mutex_unlock(&ctx->mutex);
 		errno = EAGAIN;
 		return -1;
 	}
