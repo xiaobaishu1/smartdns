@@ -1248,7 +1248,7 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, uint32_t stream_
 	if (stream_id != 0) {
 		_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 		ctx->status = HTTP2_ERR_PROTOCOL;
-		return -1;
+		return HTTP2_ERR_PROTOCOL;
 	}
 
 	if (flags & HTTP2_FLAG_ACK) {
@@ -1256,7 +1256,7 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, uint32_t stream_
 		if (len != 0) {
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
-			return -1;
+			return HTTP2_ERR_PROTOCOL;
 		}
 		return 0;
 	}
@@ -1264,7 +1264,7 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, uint32_t stream_
 	if (len < 0 || len % 6 != 0) {
 		_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 		ctx->status = HTTP2_ERR_PROTOCOL;
-		return -1;
+		return HTTP2_ERR_PROTOCOL;
 	}
 
 	/* Process settings */
@@ -1298,13 +1298,13 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, uint32_t stream_
 				if (value == 1) {
 					_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 					ctx->status = HTTP2_ERR_PROTOCOL;
-					return -1;
+					return HTTP2_ERR_PROTOCOL;
 				}
 			}
 			if (value > 1) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				return -1;
+				return HTTP2_ERR_PROTOCOL;
 			}
 			break;
 		case HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS:
@@ -1316,7 +1316,7 @@ static int _http2_process_settings_frame(struct http2_ctx *ctx, uint32_t stream_
 			if (value > (uint32_t)0x7FFFFFFF) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_FLOW_CONTROL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				return -1;
+				return HTTP2_ERR_PROTOCOL;
 			}
 			delta = (int32_t)value - ctx->peer_initial_window_size;
 			ctx->peer_initial_window_size = (int)value;
@@ -1387,7 +1387,7 @@ static int _http2_process_window_update_frame(struct http2_ctx *ctx, int stream_
 	if (len != 4) {
 		_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 		ctx->status = HTTP2_ERR_PROTOCOL;
-		return -1;
+		return HTTP2_ERR_PROTOCOL;
 	}
 
 	uint32_t increment = read_uint32(data) & 0x7FFFFFFF;
@@ -1398,7 +1398,7 @@ static int _http2_process_window_update_frame(struct http2_ctx *ctx, int stream_
 			/* Connection-level zero increment -> connection error FLOW_CONTROL_ERROR */
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_FLOW_CONTROL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
-			return -1;
+			return HTTP2_ERR_PROTOCOL;
 		} else {
 			http2_send_rst_stream(ctx, stream_id, HTTP2_RST_PROTOCOL_ERROR);
 			return 0;
@@ -1410,7 +1410,7 @@ static int _http2_process_window_update_frame(struct http2_ctx *ctx, int stream_
 		if (ctx->connection_send_window > INT_MAX - (int)increment) {
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_FLOW_CONTROL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
-			return -1;
+			return HTTP2_ERR_PROTOCOL;
 		}
 		ctx->connection_send_window += (int)increment;
 		return 0;
@@ -1619,7 +1619,7 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			if (length != 5 || stream_id == 0) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				frame_ret = -1;
+				frame_ret = HTTP2_ERR_PROTOCOL;
 				break;
 			}
 			prio_stream = _http2_find_stream(ctx, stream_id);
@@ -1638,7 +1638,7 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			if (length != 8 || stream_id != 0) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				frame_ret = -1;
+				frame_ret = HTTP2_ERR_PROTOCOL;
 				break;
 			}
 			/* Echo PING */
@@ -1656,7 +1656,7 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			if (length != 4 || stream_id == 0) {
 				_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 				ctx->status = HTTP2_ERR_PROTOCOL;
-				frame_ret = -1;
+				frame_ret = HTTP2_ERR_PROTOCOL;
 				break;
 			}
 				{
@@ -1677,7 +1677,7 @@ static int _http2_process_frames(struct http2_ctx *ctx)
 			 * is a connection error of type PROTOCOL_ERROR. */
 			_http2_send_goaway(ctx, ctx->max_peer_stream_id_seen, HTTP2_RST_PROTOCOL_ERROR, NULL, 0);
 			ctx->status = HTTP2_ERR_PROTOCOL;
-			frame_ret = -1;
+			frame_ret = HTTP2_ERR_PROTOCOL;
 			break;
 		case HTTP2_FRAME_GOAWAY:
 			if (length < 8) {
@@ -2769,7 +2769,9 @@ int http2_stream_read_body(struct http2_stream *stream, uint8_t *data, int len)
 	}
 
 	int available = stream->body_buffer_len - stream->body_read_offset;
-	if (available <= 0) {
+	int stream_ended = (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED ||
+	                    (!ctx || ctx->status < 0));
+	if (available <= 0 && !stream_ended) {
 		if (ctx) {
 			pthread_mutex_unlock(&ctx->mutex);
 		}
@@ -2844,12 +2846,10 @@ int http2_stream_is_end(struct http2_stream *stream)
 	/* Try to decompress if needed - this might change body_buffer_len */
 	http2_try_decompress_body(stream);
 
-	int is_end = (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED) && (stream->body_read_offset >= stream->body_buffer_len);
+	int stream_ended = (stream->end_stream_received || stream->state == HTTP2_STREAM_CLOSED ||
+	                    (!ctx || ctx->status < 0));
+	int is_end = stream_ended && (stream->body_read_offset >= stream->body_buffer_len);
 
-	/* If connection is closed/error, and we have read all buffered data, consider stream ended */
-	if (!is_end && (!ctx || ctx->status < 0) && stream->body_read_offset >= stream->body_buffer_len) {
-		is_end = 1;
-	}
 
 	if (ctx) {
 		pthread_mutex_unlock(&ctx->mutex);
