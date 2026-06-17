@@ -106,6 +106,8 @@ class LIBHTTP2 : public ::testing::Test
 	}
 };
 
+// ==================== 原有测试（保留） ====================
+
 TEST_F(LIBHTTP2, MultiStream)
 {
 	const int NUM_STREAMS = 3;
@@ -913,4 +915,152 @@ TEST_F(LIBHTTP2, ReferenceCountingContextError)
 
 	http2_ctx_close(ctx);
 	http2_stream_close(stream);
+}
+
+// ==================== 新增：EchoTest（基础回显测试） ====================
+TEST_F(LIBHTTP2, EchoTest)
+{
+	std::thread server_thread([this]() {
+		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
+		ASSERT_NE(ctx, nullptr);
+
+		// 服务器握手
+		int handshake_attempts = 200;
+		int ret = 0;
+		while (handshake_attempts-- > 0) {
+			struct pollfd pfd = {server_sock, POLLIN, 0};
+			int poll_ret = poll(&pfd, 1, 10);
+			if (poll_ret == 0) continue;
+			ret = http2_ctx_handshake(ctx);
+			if (ret == 1) break;
+			if (ret < 0) break;
+		}
+		ASSERT_EQ(ret, 1) << "Server handshake failed";
+
+		// 接受客户端流
+		struct http2_stream *stream = nullptr;
+		int max_attempts = 200;
+		while (max_attempts-- > 0 && !stream) {
+			struct pollfd pfd = {server_sock, POLLIN, 0};
+			poll(&pfd, 1, 100);
+			struct http2_poll_item items[10];
+			int count = 0;
+			http2_ctx_poll(ctx, items, 10, &count);
+			for (int i = 0; i < count; i++) {
+				if (items[i].stream == nullptr && items[i].readable) {
+					stream = http2_ctx_accept_stream(ctx);
+					if (stream) break;
+				}
+			}
+			usleep(20000);
+		}
+		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
+
+		// 读取请求体
+		uint8_t request_body[4096];
+		int request_body_len = 0;
+		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
+			int read_len = http2_stream_read_body(stream, request_body + request_body_len,
+			                                      sizeof(request_body) - request_body_len);
+			if (read_len <= 0) {
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				if (read_len == 0 && http2_stream_is_remote_end(stream)) {
+					break;
+				}
+				usleep(1000);
+				continue;
+			}
+			request_body_len += read_len;
+		}
+
+		// 构造回显响应（原样回显）
+		char response[4096];
+		int response_len = snprintf(response, sizeof(response), "Echo: %.*s", request_body_len, request_body);
+		char content_length[32];
+		snprintf(content_length, sizeof(content_length), "%d", response_len);
+		struct http2_header_pair headers[] = {
+			{"content-type", "text/plain"},
+			{"content-length", content_length},
+			{NULL, NULL}
+		};
+		http2_stream_set_response(stream, 200, headers, 2);
+		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
+		flush_http2_writes(ctx);
+
+		http2_stream_close(stream);
+		http2_ctx_close(ctx);
+	});
+
+	std::thread client_thread([this]() {
+		usleep(50000);
+		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
+		ASSERT_NE(ctx, nullptr);
+
+		// 客户端握手
+		int handshake_attempts = 200;
+		int ret = 0;
+		while (handshake_attempts-- > 0) {
+			struct pollfd pfd = {client_sock, POLLIN, 0};
+			poll(&pfd, 1, 10);
+			ret = http2_ctx_handshake(ctx);
+			if (ret == 1) break;
+			if (ret < 0) break;
+		}
+		ASSERT_EQ(ret, 1) << "Client handshake failed";
+
+		// 创建流并发送 POST 请求
+		struct http2_stream *stream = http2_stream_new(ctx);
+		ASSERT_NE(stream, nullptr);
+
+		const char *request_body = "Hello HTTP2!";
+		char content_length[32];
+		snprintf(content_length, sizeof(content_length), "%d", (int)strlen(request_body));
+		struct http2_header_pair headers[] = {
+			{"content-type", "text/plain"},
+			{"content-length", content_length},
+			{NULL, NULL}
+		};
+		http2_stream_set_request(stream, "POST", "/echo", NULL, headers);
+		write_body_complete(ctx, stream, (const uint8_t *)request_body, strlen(request_body));
+		flush_http2_writes(ctx);
+
+		// 等待响应状态码
+		int max_attempts = 200;
+		while (max_attempts-- > 0) {
+			struct pollfd pfd = {client_sock, POLLIN, 0};
+			poll(&pfd, 1, 100);
+			struct http2_poll_item items[10];
+			int count = 0;
+			http2_ctx_poll(ctx, items, 10, &count);
+			if (http2_stream_get_status(stream) > 0) break;
+			usleep(20000);
+		}
+		EXPECT_EQ(http2_stream_get_status(stream), 200);
+
+		// 读取响应体
+		uint8_t response_body[4096];
+		int response_body_len = 0;
+		while (!http2_stream_is_end(stream) && response_body_len < (int)sizeof(response_body)) {
+			int read_len = http2_stream_read_body(stream, response_body + response_body_len,
+			                                      sizeof(response_body) - response_body_len);
+			if (read_len <= 0) {
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				if (read_len == 0 && http2_stream_is_remote_end(stream)) break;
+				usleep(1000);
+				continue;
+			}
+			response_body_len += read_len;
+		}
+
+		// 验证回显内容
+		std::string actual((char *)response_body, response_body_len);
+		std::string expected = "Echo: " + std::string(request_body);
+		EXPECT_EQ(actual, expected) << "Echo response mismatch";
+
+		http2_stream_close(stream);
+		http2_ctx_close(ctx);
+	});
+
+	server_thread.join();
+	client_thread.join();
 }
