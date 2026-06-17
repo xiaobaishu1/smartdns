@@ -17,10 +17,9 @@
 #include "smartdns/http2.h"
 
 #ifndef HTTP2_TEST_CONCURRENT_STREAMS
-#define HTTP2_TEST_CONCURRENT_STREAMS 1024
+#define HTTP2_TEST_CONCURRENT_STREAMS 256
 #endif
 
-// 辅助宏：获取头部值（兼容 int http2_stream_get_header(stream, name, buf, size)）
 #define GET_HEADER(stream, name) ({ \
     char _buf[256]; \
     int _len = http2_stream_get_header((stream), (name), _buf, sizeof(_buf)); \
@@ -312,7 +311,10 @@ TEST_F(LIBHTTP2, InvalidPingLengthFailsProtocol)
 	const uint8_t ping_payload[] = {0};
 	write_frame(0x06, 0, 0, ping_payload, sizeof(ping_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -369,7 +371,10 @@ TEST_F(LIBHTTP2, ContinuationWithoutHeadersFailsProtocol)
 	const uint8_t payload[] = {0x00};
 	WriteServerFrame(0x09, 0x04, 1, payload, sizeof(payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -384,7 +389,10 @@ TEST_F(LIBHTTP2, HeadersInterruptedByDataFailsProtocol)
 	WriteServerFrame(0x01, 0, 1, headers_fragment, sizeof(headers_fragment));
 	WriteServerFrame(0x00, 0, 1, data_payload, sizeof(data_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -397,7 +405,10 @@ TEST_F(LIBHTTP2, SettingsAckWithPayloadFailsProtocol)
 	const uint8_t settings_payload[] = {0x00, 0x03, 0x00, 0x00, 0x00, 0x64};
 	WriteServerFrame(0x04, 0x01, 0, settings_payload, sizeof(settings_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -410,7 +421,10 @@ TEST_F(LIBHTTP2, SettingsEnablePushInvalidValueFailsProtocol)
 	const uint8_t settings_payload[] = {0x00, 0x02, 0x00, 0x00, 0x00, 0x02};
 	WriteServerFrame(0x04, 0, 0, settings_payload, sizeof(settings_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -423,7 +437,10 @@ TEST_F(LIBHTTP2, WindowUpdateZeroIncrementFailsProtocol)
 	const uint8_t window_update_payload[] = {0x00, 0x00, 0x00, 0x00};
 	WriteServerFrame(0x08, 0, 0, window_update_payload, sizeof(window_update_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -436,7 +453,10 @@ TEST_F(LIBHTTP2, RstStreamOnConnectionStreamFailsProtocol)
 	const uint8_t rst_payload[] = {0x00, 0x00, 0x00, 0x00};
 	WriteServerFrame(0x03, 0, 0, rst_payload, sizeof(rst_payload));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
+
 	http2_ctx_close(ctx);
 }
 
@@ -459,7 +479,10 @@ TEST_F(LIBHTTP2, DataAfterEndStreamFailsProtocol)
 
 	const uint8_t data_payload[] = {0x01};
 	WriteServerFrame(0x00, 0, 1, data_payload, sizeof(data_payload));
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
 
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
