@@ -837,7 +837,8 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 	std::atomic<bool> client_error{false};
 
 	// ---- Server ----
-	std::thread server_thread([this, &server_completed, &server_error]() {
+	// 使用 [&] 捕获所有局部变量（包括 NUM_STREAMS 等常量）
+	std::thread server_thread([&]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		if (!ctx) { server_error = true; return; }
 
@@ -920,7 +921,7 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 	});
 
 	// ---- Client ----
-	std::thread client_thread([this, &client_completed, &client_error]() {
+	std::thread client_thread([&]() {
 		usleep(50000);
 
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
