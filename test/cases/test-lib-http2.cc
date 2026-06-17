@@ -66,27 +66,42 @@ class LIBHTTP2 : public ::testing::Test
 		return ret;
 	}
 
-	// Helper: write body completely with retry on EAGAIN, calling poll to flush
+	// Helper: write body completely and then send END_STREAM
 	static void write_body_complete(struct http2_ctx *ctx, struct http2_stream *stream,
 	                                const uint8_t *data, int len)
 	{
 		int sent = 0;
 		while (sent < len) {
-			int ret = http2_stream_write_body(stream, data + sent, len - sent,
-			                                   (sent + (len - sent) == len) ? 1 : 0);
+			int ret = http2_stream_write_body(stream, data + sent, len - sent, 0);
 			if (ret < 0) {
 				if (errno == EAGAIN) {
 					http2_ctx_poll(ctx, NULL, 0, NULL);
 					usleep(1000);
 					continue;
 				}
-				FAIL() << "write_body_complete: write failed";
-			} else if (ret == 0) {
+				FAIL() << "write_body: write failed";
+			}
+			sent += ret;
+		}
+		// Send END_STREAM after all data is written
+		while (http2_stream_write_body(stream, NULL, 0, 1) < 0) {
+			if (errno == EAGAIN) {
 				http2_ctx_poll(ctx, NULL, 0, NULL);
 				usleep(1000);
-			} else {
-				sent += ret;
+				continue;
 			}
+			FAIL() << "write_body: failed to send END_STREAM";
+		}
+	}
+
+	// Helper to flush pending writes
+	static void flush_http2_writes(struct http2_ctx *ctx, int max_retries = 200)
+	{
+		while (http2_ctx_want_write(ctx) && max_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(5000);
 		}
 	}
 };
@@ -141,7 +156,7 @@ TEST_F(LIBHTTP2, MultiStream)
 							struct http2_header_pair headers[] = {{"content-type", "text/plain"},
 																  {"content-length", content_length}};
 							http2_stream_set_response(stream, 200, headers, 2);
-							http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
+							write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
 							streams_completed++;
 							processed_streams.insert(stream);
 						}
@@ -309,14 +324,8 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		struct http2_header_pair headers[] = {
 			{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 		http2_stream_set_response(stream, 200, headers, 2);
-		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
-		int flush_retries = 100;
-		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
-				break;
-			}
-			usleep(1000);
-		}
+		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
+		flush_http2_writes(ctx);
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -372,7 +381,9 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			if (read_len > 0) {
 				response_body_len += read_len;
 			} else {
-				usleep(10000);
+				if (read_len == 0 && http2_stream_is_remote_end(stream)) break;
+				http2_ctx_poll(ctx, NULL, 0, NULL);
+				usleep(1000);
 			}
 		}
 
@@ -536,15 +547,8 @@ TEST_F(LIBHTTP2, StreamClose)
 		uint8_t buf[1024];
 		http2_stream_read_body(stream, buf, sizeof(buf));
 		http2_stream_set_response(stream, 200, NULL, 0);
-		http2_stream_write_body(stream, (const uint8_t *)"OK", 2, 1);
-
-		int flush_retries = 100;
-		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
-				break;
-			}
-			usleep(1000);
-		}
+		write_body_complete(ctx, stream, (const uint8_t *)"OK", 2);
+		flush_http2_writes(ctx);
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -673,14 +677,9 @@ TEST_F(LIBHTTP2, Integrated)
 			{NULL, NULL}
 		};
 		http2_stream_set_response(stream, 200, headers, 2);
-		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
-
-		int flush_retries = 100;
-		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) break;
-			usleep(1000);
-		}
-		http2_stream_close(stream);
+		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
+		flush_http2_writes(ctx);
+		// Do NOT call http2_stream_close here; let http2_ctx_close handle cleanup
 		http2_ctx_close(ctx);
 	});
 
@@ -711,13 +710,7 @@ TEST_F(LIBHTTP2, Integrated)
 		http2_stream_set_request(stream, "POST", "/echo", NULL, headers);
 		const char *request_body = "{\"message\":\"Hello Echo!\"}";
 		write_body_complete(ctx, stream, (const uint8_t *)request_body, strlen(request_body));
-
-		// Flush request data to server
-		int flush_retries = 100;
-		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) break;
-			usleep(1000);
-		}
+		flush_http2_writes(ctx);
 
 		int max_attempts = 200;
 		while (max_attempts-- > 0) {
@@ -805,7 +798,7 @@ TEST_F(LIBHTTP2, StressTest)
 							{NULL, NULL}
 						};
 						http2_stream_set_response(stream, 200, headers, 2);
-						http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
+						write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
 					}
 				}
 				if (items[i].stream) http2_stream_put(items[i].stream);
@@ -878,12 +871,7 @@ TEST_F(LIBHTTP2, StressTest)
 			if ((i+1) % 10 == 0) process_events(0);
 		}
 
-		// Flush all pending writes
-		int flush_retries = 100;
-		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) break;
-			usleep(1000);
-		}
+		flush_http2_writes(ctx);
 
 		start = std::chrono::steady_clock::now();
 		while (client_completed < NUM_STREAMS &&
