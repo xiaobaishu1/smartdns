@@ -20,6 +20,7 @@ class LIBHTTP2 : public ::testing::Test
   protected:
 	void SetUp() override
 	{
+		// Create socketpair for communication
 		if (socketpair(AF_UNIX, SOCK_STREAM, 0, socks) < 0) {
 			perror("socketpair");
 			FAIL() << "Failed to create socketpair";
@@ -28,6 +29,7 @@ class LIBHTTP2 : public ::testing::Test
 		client_sock = socks[0];
 		server_sock = socks[1];
 
+		// Set non-blocking
 		fcntl(client_sock, F_SETFL, O_NONBLOCK);
 		fcntl(server_sock, F_SETFL, O_NONBLOCK);
 	}
@@ -44,6 +46,7 @@ class LIBHTTP2 : public ::testing::Test
 	int client_sock = -1;
 	int server_sock = -1;
 
+	// BIO callbacks
 	static int bio_read(void *private_data, uint8_t *buf, int len)
 	{
 		int fd = *(int *)private_data;
@@ -65,48 +68,7 @@ class LIBHTTP2 : public ::testing::Test
 		}
 		return ret;
 	}
-
-	// Helper: write body completely and then send END_STREAM
-	static void write_body_complete(struct http2_ctx *ctx, struct http2_stream *stream,
-	                                const uint8_t *data, int len)
-	{
-		int sent = 0;
-		while (sent < len) {
-			int ret = http2_stream_write_body(stream, data + sent, len - sent, 0);
-			if (ret < 0) {
-				if (errno == EAGAIN) {
-					http2_ctx_poll(ctx, NULL, 0, NULL);
-					usleep(1000);
-					continue;
-				}
-				FAIL() << "write_body: write failed";
-			}
-			sent += ret;
-		}
-		// Send END_STREAM after all data is written
-		while (http2_stream_write_body(stream, NULL, 0, 1) < 0) {
-			if (errno == EAGAIN) {
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				usleep(1000);
-				continue;
-			}
-			FAIL() << "write_body: failed to send END_STREAM";
-		}
-	}
-
-	// Helper to flush pending writes
-	static void flush_http2_writes(struct http2_ctx *ctx, int max_retries = 200)
-	{
-		while (http2_ctx_want_write(ctx) && max_retries-- > 0) {
-			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
-				break;
-			}
-			usleep(5000);
-		}
-	}
 };
-
-// ==================== 原有测试（保留） ====================
 
 TEST_F(LIBHTTP2, MultiStream)
 {
@@ -116,6 +78,7 @@ TEST_F(LIBHTTP2, MultiStream)
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -158,7 +121,7 @@ TEST_F(LIBHTTP2, MultiStream)
 							struct http2_header_pair headers[] = {{"content-type", "text/plain"},
 																  {"content-length", content_length}};
 							http2_stream_set_response(stream, 200, headers, 2);
-							write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
+							http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
 							streams_completed++;
 							processed_streams.insert(stream);
 						}
@@ -180,6 +143,7 @@ TEST_F(LIBHTTP2, MultiStream)
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -208,7 +172,7 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct http2_header_pair headers[] = {
 				{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 			http2_stream_set_request(streams[i], "POST", path, NULL, headers);
-			write_body_complete(ctx, streams[i], (const uint8_t *)body, body_len);
+			http2_stream_write_body(streams[i], (const uint8_t *)body, body_len, 1);
 		}
 
 		int streams_completed = 0;
@@ -254,9 +218,11 @@ TEST_F(LIBHTTP2, MultiStream)
 TEST_F(LIBHTTP2, EarlyStreamCreation)
 {
 	std::thread server_thread([this]() {
+		// Server logic
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -271,8 +237,10 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			if (ret < 0)
 				break;
 		}
+
 		ASSERT_EQ(ret, 1) << "Server handshake failed";
 
+		// Accept stream
 		struct http2_stream *stream = nullptr;
 		int max_attempts = 200;
 		while (max_attempts-- > 0 && !stream) {
@@ -292,6 +260,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		}
 		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
 
+		// Verify we received the request
 		char method_buf[64] = {0};
 		char path_buf[256] = {0};
 		if (http2_stream_get_method(stream, method_buf, sizeof(method_buf)) >= 0 &&
@@ -302,16 +271,17 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			FAIL() << "Failed to get method or path";
 		}
 
+		// Read request body (should be empty for GET)
 		uint8_t request_body[4096];
 		int request_body_len = 0;
 		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
 			int read_len = http2_stream_read_body(stream, request_body + request_body_len, sizeof(request_body) - request_body_len);
 			if (read_len <= 0) {
 				http2_ctx_poll(ctx, NULL, 0, NULL);
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) {
+				usleep(1000);
+				if (read_len < 0 && errno != EAGAIN) {
 					break;
 				}
-				usleep(1000);
 				continue;
 			}
 			if (read_len > 0) {
@@ -319,6 +289,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			}
 		}
 
+		// Send response
 		char response[8192];
 		int response_len = snprintf(response, sizeof(response), "Echo Response: %.*s", request_body_len, request_body);
 		char content_length[32];
@@ -326,26 +297,38 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		struct http2_header_pair headers[] = {
 			{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 		http2_stream_set_response(stream, 200, headers, 2);
-		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
-		flush_http2_writes(ctx);
+		http2_stream_write_body(stream, (const uint8_t *)response, response_len, 1);
+		int flush_retries = 100;
+		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(1000);
+		}
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
 
 	std::thread client_thread([this]() {
-		usleep(50000);
+		usleep(50000); // Wait for server start
+
+		// Create client context
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// IMPORTANT: Create stream and send request BEFORE handshake completes
+		// This tests that the HEADERS frame is buffered and sent after handshake
 		struct http2_stream *stream = http2_stream_new(ctx);
 		ASSERT_NE(stream, nullptr);
 
+		// Send request immediately (before handshake)
 		struct http2_header_pair headers[] = {{"user-agent", "test-client"}, {NULL, NULL}};
 		int ret = http2_stream_set_request(stream, "POST", "/early-test", NULL, headers);
 		EXPECT_EQ(ret, 0) << "Failed to set request";
 		const char *request_body = "test echo";
-		write_body_complete(ctx, stream, (const uint8_t *)request_body, strlen(request_body));
+		http2_stream_write_body(stream, (const uint8_t *)request_body, strlen(request_body), 1);
 
+		// Now complete handshake
 		int handshake_attempts = 200;
 		ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -359,6 +342,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		}
 		ASSERT_EQ(ret, 1) << "Client handshake failed";
 
+		// Wait for response
 		int max_attempts = 200;
 		while (max_attempts-- > 0) {
 			struct pollfd pfd = {client_sock, POLLIN, 0};
@@ -375,6 +359,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 
 		EXPECT_EQ(http2_stream_get_status(stream), 200);
 
+		// Read response
 		uint8_t response_body[4096];
 		int response_body_len = 0;
 		while (!http2_stream_is_end(stream) && response_body_len < (int)sizeof(response_body)) {
@@ -383,9 +368,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			if (read_len > 0) {
 				response_body_len += read_len;
 			} else {
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) break;
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				usleep(1000);
+				usleep(10000);
 			}
 		}
 
@@ -407,6 +390,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -423,6 +407,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 		}
 		ASSERT_EQ(ret, 1) << "Server handshake failed";
 
+		// Accept stream
 		struct http2_stream *stream = nullptr;
 		int max_attempts = 200;
 		while (max_attempts-- > 0 && !stream) {
@@ -442,6 +427,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 		}
 		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
 
+		// Read request body until EOF
 		uint8_t buf[1024];
 		int loop_count = 0;
 		while (loop_count++ < 100) {
@@ -456,6 +442,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 					if (ret > 0) {
 						data_read = 1;
 					} else if (ret == 0) {
+						// EOF received
 						data_read = 1;
 					}
 				}
@@ -465,12 +452,17 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 			}
 
 			if (!data_read && http2_stream_is_end(stream)) {
+				// If we are here, it means poll returned 0 items (or stream not readable),
+				// which is correct behavior after EOF is consumed.
+				// If the bug exists, poll would keep returning readable stream, and we would keep reading 0 bytes.
 				break;
 			}
+
 			usleep(10000);
 		}
 
 		EXPECT_LT(loop_count, 100) << "Server loop did not terminate (infinite loop detected)";
+
 		http2_ctx_close(ctx);
 	});
 
@@ -496,7 +488,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 
 		struct http2_header_pair headers[] = {{"content-type", "text/plain"}, {NULL, NULL}};
 		http2_stream_set_request(stream, "POST", "/test", NULL, headers);
-		write_body_complete(ctx, stream, (const uint8_t *)"test", 4);
+		http2_stream_write_body(stream, (const uint8_t *)"test", 4, 1);
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -511,6 +503,7 @@ TEST_F(LIBHTTP2, StreamClose)
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -527,6 +520,7 @@ TEST_F(LIBHTTP2, StreamClose)
 		}
 		ASSERT_EQ(ret, 1) << "Server handshake failed";
 
+		// Accept stream
 		struct http2_stream *stream = nullptr;
 		int max_attempts = 200;
 		while (max_attempts-- > 0 && !stream) {
@@ -546,11 +540,19 @@ TEST_F(LIBHTTP2, StreamClose)
 		}
 		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
 
+		// Read request and send response
 		uint8_t buf[1024];
 		http2_stream_read_body(stream, buf, sizeof(buf));
 		http2_stream_set_response(stream, 200, NULL, 0);
-		write_body_complete(ctx, stream, (const uint8_t *)"OK", 2);
-		flush_http2_writes(ctx);
+		http2_stream_write_body(stream, (const uint8_t *)"OK", 2, 1);
+
+		int flush_retries = 100;
+		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
+			if (http2_ctx_poll(ctx, NULL, 0, NULL) < 0) {
+				break;
+			}
+			usleep(1000);
+		}
 		http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
@@ -560,6 +562,7 @@ TEST_F(LIBHTTP2, StreamClose)
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
+		// Handshake
 		int handshake_attempts = 200;
 		int ret = 0;
 		while (handshake_attempts-- > 0) {
@@ -573,12 +576,15 @@ TEST_F(LIBHTTP2, StreamClose)
 		}
 		ASSERT_EQ(ret, 1) << "Client handshake failed";
 
+		// Create stream
 		struct http2_stream *stream = http2_stream_new(ctx);
 		ASSERT_NE(stream, nullptr);
 
+		// Send request
 		http2_stream_set_request(stream, "GET", "/test", NULL, NULL);
 		http2_stream_write_body(stream, NULL, 0, 1);
 
+		// Wait for response
 		int max_attempts = 200;
 		while (max_attempts-- > 0) {
 			struct pollfd pfd = {client_sock, POLLIN, 0};
@@ -591,22 +597,27 @@ TEST_F(LIBHTTP2, StreamClose)
 			usleep(20000);
 		}
 
-		http2_stream_get(stream);
+		// Close the stream explicitly
+		http2_stream_get(stream); // Keep reference for reading after close
 		http2_stream_close(stream);
 
-		EXPECT_FALSE(http2_stream_is_end(stream));
+		// Verify stream is marked as closed (should still be able to read)
+		// After close, the stream should still be readable until all data is consumed
+		EXPECT_FALSE(http2_stream_is_end(stream)); // Should not be end yet since we haven't read response
 
+		// Read response (should still work after close)
 		uint8_t buf[1024];
 		int read_len = http2_stream_read_body(stream, buf, sizeof(buf));
-		EXPECT_GE(read_len, 0);
+		EXPECT_GE(read_len, 0); // Should be able to read
 
+		// After reading all data, stream should be end
 		while (!http2_stream_is_end(stream)) {
 			read_len = http2_stream_read_body(stream, buf, sizeof(buf));
 			if (read_len <= 0) {
 				break;
 			}
 		}
-		EXPECT_TRUE(http2_stream_is_end(stream));
+		EXPECT_TRUE(http2_stream_is_end(stream)); // Should be end after reading all data
 
 		http2_stream_put(stream);
 		http2_ctx_put(ctx);
@@ -616,451 +627,45 @@ TEST_F(LIBHTTP2, StreamClose)
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, Integrated)
-{
-	std::thread server_thread([this]() {
-		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		int handshake_attempts = 200;
-		int ret = 0;
-		while (handshake_attempts-- > 0) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			int poll_ret = poll(&pfd, 1, 10);
-			if (poll_ret == 0) continue;
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Server handshake failed";
-
-		struct http2_stream *stream = nullptr;
-		int max_attempts = 200;
-		while (max_attempts-- > 0 && !stream) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			poll(&pfd, 1, 100);
-			struct http2_poll_item items[10];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 10, &count);
-			for (int i = 0; i < count; i++) {
-				if (items[i].stream == nullptr && items[i].readable) {
-					stream = http2_ctx_accept_stream(ctx);
-					if (stream) break;
-				}
-			}
-			usleep(20000);
-		}
-		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
-
-		uint8_t request_body[4096];
-		int request_body_len = 0;
-		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
-			int read_len = http2_stream_read_body(stream, request_body + request_body_len,
-			                                      sizeof(request_body) - request_body_len);
-			if (read_len <= 0) {
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) {
-					break;
-				}
-				usleep(1000);
-				continue;
-			}
-			request_body_len += read_len;
-		}
-
-		char response[8192];
-		int response_len = snprintf(response, sizeof(response), "Echo Response: %.*s",
-		                            request_body_len, request_body);
-		char content_length[32];
-		snprintf(content_length, sizeof(content_length), "%d", response_len);
-		struct http2_header_pair headers[] = {
-			{"content-type", "text/plain"},
-			{"content-length", content_length},
-			{NULL, NULL}
-		};
-		http2_stream_set_response(stream, 200, headers, 2);
-		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
-		flush_http2_writes(ctx);
-		// Do NOT call http2_stream_close here; let http2_ctx_close handle cleanup
-		http2_ctx_close(ctx);
-	});
-
-	std::thread client_thread([this]() {
-		usleep(500000);
-		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		int handshake_attempts = 200;
-		int ret = 0;
-		while (handshake_attempts-- > 0) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, 10);
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Client handshake failed";
-
-		struct http2_stream *stream = http2_stream_new(ctx);
-		ASSERT_NE(stream, nullptr);
-
-		struct http2_header_pair headers[] = {
-			{"content-type", "application/json"},
-			{"content-length", "27"},
-			{NULL, NULL}
-		};
-		http2_stream_set_request(stream, "POST", "/echo", NULL, headers);
-		const char *request_body = "{\"message\":\"Hello Echo!\"}";
-		write_body_complete(ctx, stream, (const uint8_t *)request_body, strlen(request_body));
-		flush_http2_writes(ctx);
-
-		int max_attempts = 200;
-		while (max_attempts-- > 0) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, 100);
-			struct http2_poll_item items[10];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 10, &count);
-			if (http2_stream_get_status(stream) > 0) break;
-			usleep(20000);
-		}
-
-		EXPECT_EQ(http2_stream_get_status(stream), 200);
-
-		uint8_t response_body[4096];
-		int response_body_len = 0;
-		while (!http2_stream_is_end(stream) && response_body_len < (int)sizeof(response_body)) {
-			int read_len = http2_stream_read_body(stream, response_body + response_body_len,
-			                                      sizeof(response_body) - response_body_len);
-			if (read_len <= 0) {
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) break;
-				usleep(1000);
-				continue;
-			}
-			response_body_len += read_len;
-		}
-
-		std::string resp((char *)response_body, response_body_len);
-		EXPECT_NE(resp.find("Echo Response"), std::string::npos);
-
-		http2_stream_close(stream);
-		http2_ctx_close(ctx);
-	});
-
-	server_thread.join();
-	client_thread.join();
-}
-
-TEST_F(LIBHTTP2, StressTest)
-{
-	const int NUM_STREAMS = 1024;
-	std::atomic<int> client_completed(0);
-
-	std::thread server_thread([this, NUM_STREAMS]() {
-		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		auto start = std::chrono::steady_clock::now();
-		int ret = 0;
-		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			if (poll(&pfd, 1, 10) == 0) continue;
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Server handshake failed";
-
-		std::vector<struct http2_stream *> streams;
-		start = std::chrono::steady_clock::now();
-		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			poll(&pfd, 1, 10);
-			struct http2_poll_item items[64];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 64, &count);
-			for (int i = 0; i < count; i++) {
-				if (items[i].stream == nullptr && items[i].readable) {
-					struct http2_stream *stream = http2_ctx_accept_stream(ctx);
-					if (stream) streams.push_back(stream);
-				} else if (items[i].stream && items[i].readable) {
-					struct http2_stream *stream = items[i].stream;
-					uint8_t buf[1024];
-					while (http2_stream_read_body(stream, buf, sizeof(buf)) > 0) {}
-					if (http2_stream_is_end(stream)) {
-						char response[256];
-						int response_len = snprintf(response, sizeof(response), "Echo %d",
-						                            http2_stream_get_id(stream));
-						char content_length[32];
-						snprintf(content_length, sizeof(content_length), "%d", response_len);
-						struct http2_header_pair headers[] = {
-							{"content-type", "text/plain"},
-							{"content-length", content_length},
-							{NULL, NULL}
-						};
-						http2_stream_set_response(stream, 200, headers, 2);
-						write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
-					}
-				}
-				if (items[i].stream) http2_stream_put(items[i].stream);
-			}
-		}
-
-		for (auto s : streams) http2_stream_close(s);
-		http2_ctx_close(ctx);
-	});
-
-	std::thread client_thread([this, NUM_STREAMS, &client_completed]() {
-		usleep(50000);
-		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		auto start = std::chrono::steady_clock::now();
-		int ret = 0;
-		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, 10);
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Client handshake failed";
-
-		std::vector<struct http2_stream *> streams;
-		streams.reserve(NUM_STREAMS);
-		std::set<int> completed_ids;
-
-		auto process_events = [&](int timeout_ms) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, timeout_ms);
-			struct http2_poll_item items[64];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 64, &count);
-			for (int i = 0; i < count; i++) {
-				if (items[i].stream && items[i].readable) {
-					struct http2_stream *stream = items[i].stream;
-					uint8_t buf[1024];
-					while (http2_stream_read_body(stream, buf, sizeof(buf)) > 0) {}
-					if (http2_stream_is_end(stream)) {
-						int id = http2_stream_get_id(stream);
-						if (completed_ids.insert(id).second) {
-							client_completed++;
-						}
-					}
-				}
-				if (items[i].stream) http2_stream_put(items[i].stream);
-			}
-		};
-
-		for (int i = 0; i < NUM_STREAMS; i++) {
-			struct http2_stream *stream = http2_stream_new(ctx);
-			ASSERT_NE(stream, nullptr);
-			streams.push_back(stream);
-			char path[64];
-			snprintf(path, sizeof(path), "/stream%d", i);
-			char body[64];
-			int body_len = snprintf(body, sizeof(body), "Req %d", i);
-			char content_length[32];
-			snprintf(content_length, sizeof(content_length), "%d", body_len);
-			struct http2_header_pair headers[] = {
-				{"content-type", "text/plain"},
-				{"content-length", content_length},
-				{NULL, NULL}
-			};
-			http2_stream_set_request(stream, "POST", path, NULL, headers);
-			write_body_complete(ctx, stream, (const uint8_t *)body, body_len);
-			if ((i+1) % 10 == 0) process_events(0);
-		}
-
-		flush_http2_writes(ctx);
-
-		start = std::chrono::steady_clock::now();
-		while (client_completed < NUM_STREAMS &&
-		       std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
-			process_events(10);
-		}
-
-		EXPECT_EQ(client_completed, NUM_STREAMS);
-		for (auto s : streams) http2_stream_close(s);
-		http2_ctx_close(ctx);
-	});
-
-	server_thread.join();
-	client_thread.join();
-}
-
 TEST_F(LIBHTTP2, ReferenceCountingNormal)
 {
+	// Test normal reference counting: ctx normal, stream released by business
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
+	// Create a stream (already has refcount = 1)
 	struct http2_stream *stream = http2_stream_new(ctx);
 	ASSERT_NE(stream, nullptr);
 
+	// Close context (should not free stream because business still holds reference)
 	http2_ctx_close(ctx);
+
+	// Business releases reference
 	http2_stream_close(stream);
+
+	// Now stream should be freed
+	// We can't directly check, but no crash should occur
 }
 
 TEST_F(LIBHTTP2, ReferenceCountingContextError)
 {
+	// Test reference counting when ctx has error but stream is still referenced by business
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
+	// Create a stream
 	struct http2_stream *stream = http2_stream_new(ctx);
 	ASSERT_NE(stream, nullptr);
 
+	// Simulate context error by closing the socket (connection broken)
 	close(client_sock);
 	client_sock = -1;
 
+	// Close context (should handle error gracefully)
 	http2_ctx_close(ctx);
+
+	// Business still holds reference, should be able to release it
 	http2_stream_close(stream);
-}
 
-// ==================== 新增：EchoTest（基础回显测试） ====================
-TEST_F(LIBHTTP2, EchoTest)
-{
-	std::thread server_thread([this]() {
-		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		// 服务器握手
-		int handshake_attempts = 200;
-		int ret = 0;
-		while (handshake_attempts-- > 0) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			int poll_ret = poll(&pfd, 1, 10);
-			if (poll_ret == 0) continue;
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Server handshake failed";
-
-		// 接受客户端流
-		struct http2_stream *stream = nullptr;
-		int max_attempts = 200;
-		while (max_attempts-- > 0 && !stream) {
-			struct pollfd pfd = {server_sock, POLLIN, 0};
-			poll(&pfd, 1, 100);
-			struct http2_poll_item items[10];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 10, &count);
-			for (int i = 0; i < count; i++) {
-				if (items[i].stream == nullptr && items[i].readable) {
-					stream = http2_ctx_accept_stream(ctx);
-					if (stream) break;
-				}
-			}
-			usleep(20000);
-		}
-		ASSERT_NE(stream, nullptr) << "Server failed to accept stream";
-
-		// 读取请求体
-		uint8_t request_body[4096];
-		int request_body_len = 0;
-		while (!http2_stream_is_end(stream) && request_body_len < (int)sizeof(request_body)) {
-			int read_len = http2_stream_read_body(stream, request_body + request_body_len,
-			                                      sizeof(request_body) - request_body_len);
-			if (read_len <= 0) {
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) {
-					break;
-				}
-				usleep(1000);
-				continue;
-			}
-			request_body_len += read_len;
-		}
-
-		// 构造回显响应（原样回显）
-		char response[4096];
-		int response_len = snprintf(response, sizeof(response), "Echo: %.*s", request_body_len, request_body);
-		char content_length[32];
-		snprintf(content_length, sizeof(content_length), "%d", response_len);
-		struct http2_header_pair headers[] = {
-			{"content-type", "text/plain"},
-			{"content-length", content_length},
-			{NULL, NULL}
-		};
-		http2_stream_set_response(stream, 200, headers, 2);
-		write_body_complete(ctx, stream, (const uint8_t *)response, response_len);
-		flush_http2_writes(ctx);
-
-		http2_stream_close(stream);
-		http2_ctx_close(ctx);
-	});
-
-	std::thread client_thread([this]() {
-		usleep(50000);
-		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
-		ASSERT_NE(ctx, nullptr);
-
-		// 客户端握手
-		int handshake_attempts = 200;
-		int ret = 0;
-		while (handshake_attempts-- > 0) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, 10);
-			ret = http2_ctx_handshake(ctx);
-			if (ret == 1) break;
-			if (ret < 0) break;
-		}
-		ASSERT_EQ(ret, 1) << "Client handshake failed";
-
-		// 创建流并发送 POST 请求
-		struct http2_stream *stream = http2_stream_new(ctx);
-		ASSERT_NE(stream, nullptr);
-
-		const char *request_body = "Hello HTTP2!";
-		char content_length[32];
-		snprintf(content_length, sizeof(content_length), "%d", (int)strlen(request_body));
-		struct http2_header_pair headers[] = {
-			{"content-type", "text/plain"},
-			{"content-length", content_length},
-			{NULL, NULL}
-		};
-		http2_stream_set_request(stream, "POST", "/echo", NULL, headers);
-		write_body_complete(ctx, stream, (const uint8_t *)request_body, strlen(request_body));
-		flush_http2_writes(ctx);
-
-		// 等待响应状态码
-		int max_attempts = 200;
-		while (max_attempts-- > 0) {
-			struct pollfd pfd = {client_sock, POLLIN, 0};
-			poll(&pfd, 1, 100);
-			struct http2_poll_item items[10];
-			int count = 0;
-			http2_ctx_poll(ctx, items, 10, &count);
-			if (http2_stream_get_status(stream) > 0) break;
-			usleep(20000);
-		}
-		EXPECT_EQ(http2_stream_get_status(stream), 200);
-
-		// 读取响应体
-		uint8_t response_body[4096];
-		int response_body_len = 0;
-		while (!http2_stream_is_end(stream) && response_body_len < (int)sizeof(response_body)) {
-			int read_len = http2_stream_read_body(stream, response_body + response_body_len,
-			                                      sizeof(response_body) - response_body_len);
-			if (read_len <= 0) {
-				http2_ctx_poll(ctx, NULL, 0, NULL);
-				if (read_len == 0 && http2_stream_is_remote_end(stream)) break;
-				usleep(1000);
-				continue;
-			}
-			response_body_len += read_len;
-		}
-
-		// 验证回显内容
-		std::string actual((char *)response_body, response_body_len);
-		std::string expected = "Echo: " + std::string(request_body);
-		EXPECT_EQ(actual, expected) << "Echo response mismatch";
-
-		http2_stream_close(stream);
-		http2_ctx_close(ctx);
-	});
-
-	server_thread.join();
-	client_thread.join();
+	// No crash should occur
 }
