@@ -20,6 +20,13 @@
 #define HTTP2_TEST_CONCURRENT_STREAMS 1024
 #endif
 
+// 辅助宏：获取头部值（兼容 int http2_stream_get_header(stream, name, buf, size)）
+#define GET_HEADER(stream, name) ({ \
+    char _buf[256]; \
+    int _len = http2_stream_get_header((stream), (name), _buf, sizeof(_buf)); \
+    (_len >= 0) ? _buf : nullptr; \
+})
+
 class LIBHTTP2 : public ::testing::Test
 {
   protected:
@@ -265,8 +272,8 @@ TEST_F(LIBHTTP2, RequestHostHeaderOverridesAuthority)
 	}
 
 	ASSERT_NE(server_stream, nullptr);
-	EXPECT_STREQ(http2_stream_get_header(server_stream, ":authority"), "cloudflare-dns.com");
-	EXPECT_EQ(http2_stream_get_header(server_stream, "host"), nullptr);
+	EXPECT_STREQ(GET_HEADER(server_stream, ":authority"), "cloudflare-dns.com");
+	EXPECT_EQ(GET_HEADER(server_stream, "host"), nullptr);
 
 	http2_stream_close(server_stream);
 	http2_stream_close(client_stream);
@@ -1388,4 +1395,3 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 	EXPECT_EQ(server_completed.load(), NUM_STREAMS);
 	EXPECT_EQ(client_completed.load(), NUM_STREAMS);
 }
-
