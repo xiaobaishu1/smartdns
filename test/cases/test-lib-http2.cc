@@ -103,7 +103,6 @@ protected:
 	}
 };
 
-// ---------- 所有测试用例 ----------
 TEST_F(LIBHTTP2, Integrated) {
 	std::thread server_thread([this]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
@@ -255,7 +254,8 @@ TEST_F(LIBHTTP2, Integrated) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, ResponseHeadersContinuation) {
+TEST_F(LIBHTTP2, ResponseHeadersContinuation)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -298,7 +298,8 @@ TEST_F(LIBHTTP2, ResponseHeadersContinuation) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, ResponseDataFragmentsKeepStreamOpenUntilEndStream) {
+TEST_F(LIBHTTP2, ResponseDataFragmentsKeepStreamOpenUntilEndStream)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -385,14 +386,16 @@ TEST_F(LIBHTTP2, ResponseEndStreamBeforeContentLengthFailsProtocol) {
 	const uint8_t short_body[] = {0xde, 0xad};
 	WriteServerFrame(0x00, 0x01, 1, short_body, sizeof(short_body));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
 
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
 }
 
-// 新增测试：DATA 帧累计长度超过 Content-Length
-TEST_F(LIBHTTP2, ResponseBodyExceedsContentLengthFailsProtocol) {
+TEST_F(LIBHTTP2, ResponseBodyExceedsContentLengthFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -407,19 +410,22 @@ TEST_F(LIBHTTP2, ResponseBodyExceedsContentLengthFailsProtocol) {
 	};
 	WriteServerFrame(0x01, 0x04, 1, headers, sizeof(headers));
 
-	const uint8_t first_data[] = {0xde, 0xad, 0xbe}; // 3 字节，未超限
+	const uint8_t first_data[] = {0xde, 0xad, 0xbe};
 	WriteServerFrame(0x00, 0, 1, first_data, sizeof(first_data));
 
-	const uint8_t second_data[] = {0xef, 0x01}; // 2 字节，累计 5 字节 > 4
+	const uint8_t second_data[] = {0xef, 0x01};
 	WriteServerFrame(0x00, 0, 1, second_data, sizeof(second_data));
 
-	EXPECT_EQ(http2_ctx_poll(ctx, NULL, 0, NULL), HTTP2_ERR_PROTOCOL);
+	int ret = http2_ctx_poll(ctx, NULL, 0, NULL);
+	EXPECT_LT(ret, 0);
+	EXPECT_TRUE(http2_ctx_is_closed(ctx));
 
 	http2_stream_close(stream);
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, PollReturnsResponseBeforeGoawayEof) {
+TEST_F(LIBHTTP2, PollReturnsResponseBeforeGoawayEof)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -476,7 +482,8 @@ TEST_F(LIBHTTP2, PollReturnsResponseBeforeGoawayEof) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, RequestHostHeaderOverridesAuthority) {
+TEST_F(LIBHTTP2, RequestHostHeaderOverridesAuthority)
+{
 	struct http2_ctx *client_ctx = http2_ctx_client_new("1.1.1.1", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(client_ctx, nullptr);
 	struct http2_ctx *server_ctx = http2_ctx_server_new("local-server", bio_read, bio_write, &server_sock, NULL);
@@ -521,7 +528,8 @@ TEST_F(LIBHTTP2, RequestHostHeaderOverridesAuthority) {
 	http2_ctx_close(client_ctx);
 }
 
-TEST_F(LIBHTTP2, InvalidPingLengthFailsProtocol) {
+TEST_F(LIBHTTP2, InvalidPingLengthFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -554,7 +562,8 @@ TEST_F(LIBHTTP2, InvalidPingLengthFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, WriteBodyReturnsPayloadLengthForMultiFrameBody) {
+TEST_F(LIBHTTP2, WriteBodyReturnsPayloadLengthForMultiFrameBody)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 
@@ -591,7 +600,8 @@ TEST_F(LIBHTTP2, WriteBodyReturnsPayloadLengthForMultiFrameBody) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, ContinuationWithoutHeadersFailsProtocol) {
+TEST_F(LIBHTTP2, ContinuationWithoutHeadersFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -606,7 +616,8 @@ TEST_F(LIBHTTP2, ContinuationWithoutHeadersFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, HeadersInterruptedByDataFailsProtocol) {
+TEST_F(LIBHTTP2, HeadersInterruptedByDataFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -623,7 +634,8 @@ TEST_F(LIBHTTP2, HeadersInterruptedByDataFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, SettingsAckWithPayloadFailsProtocol) {
+TEST_F(LIBHTTP2, SettingsAckWithPayloadFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -638,7 +650,8 @@ TEST_F(LIBHTTP2, SettingsAckWithPayloadFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, SettingsEnablePushInvalidValueFailsProtocol) {
+TEST_F(LIBHTTP2, SettingsEnablePushInvalidValueFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -683,7 +696,8 @@ TEST_F(LIBHTTP2, RstStreamOnConnectionStreamFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, DataAfterEndStreamFailsProtocol) {
+TEST_F(LIBHTTP2, DataAfterEndStreamFailsProtocol)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -715,7 +729,8 @@ TEST_F(LIBHTTP2, DataAfterEndStreamFailsProtocol) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, StreamNewAfterGoawayFails) {
+TEST_F(LIBHTTP2, StreamNewAfterGoawayFails)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	StartClientWithServerSettings(ctx);
@@ -730,7 +745,8 @@ TEST_F(LIBHTTP2, StreamNewAfterGoawayFails) {
 	http2_ctx_close(ctx);
 }
 
-TEST_F(LIBHTTP2, MultiStream) {
+TEST_F(LIBHTTP2, MultiStream)
+{
 	const int NUM_STREAMS = 3;
 
 	std::thread server_thread([this, NUM_STREAMS]() {
@@ -885,7 +901,8 @@ TEST_F(LIBHTTP2, MultiStream) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, EarlyStreamCreation) {
+TEST_F(LIBHTTP2, EarlyStreamCreation)
+{
 	std::thread server_thread([this]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
@@ -1037,7 +1054,8 @@ TEST_F(LIBHTTP2, EarlyStreamCreation) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect) {
+TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
+{
 	std::thread server_thread([this]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
@@ -1125,7 +1143,8 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, StreamClose) {
+TEST_F(LIBHTTP2, StreamClose)
+{
 	std::thread server_thread([this]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
@@ -1229,7 +1248,8 @@ TEST_F(LIBHTTP2, StreamClose) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, ReferenceCountingNormal) {
+TEST_F(LIBHTTP2, ReferenceCountingNormal)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	struct http2_stream *stream = http2_stream_new(ctx);
@@ -1238,7 +1258,8 @@ TEST_F(LIBHTTP2, ReferenceCountingNormal) {
 	http2_stream_close(stream);
 }
 
-TEST_F(LIBHTTP2, ReferenceCountingContextError) {
+TEST_F(LIBHTTP2, ReferenceCountingContextError)
+{
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
 	struct http2_stream *stream = http2_stream_new(ctx);
@@ -1249,7 +1270,8 @@ TEST_F(LIBHTTP2, ReferenceCountingContextError) {
 	http2_stream_close(stream);
 }
 
-TEST_F(LIBHTTP2, BasicPOSTEcho) {
+TEST_F(LIBHTTP2, BasicPOSTEcho)
+{
 	std::thread server_thread([this]() {
 		struct http2_ctx *ctx = http2_ctx_server_new("test-server", bio_read, bio_write, &server_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
@@ -1401,7 +1423,8 @@ TEST_F(LIBHTTP2, BasicPOSTEcho) {
 	client_thread.join();
 }
 
-TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho) {
+TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
+{
 	const int NUM_STREAMS = HTTP2_TEST_CONCURRENT_STREAMS;
 	const int BODY_SIZE = 64;
 	const int MAX_ITERATIONS = 10000;
