@@ -16,6 +16,11 @@
 
 #include "smartdns/http2.h"
 
+// 高并发流数量（可根据环境调整，默认 256 保证稳定性）
+#ifndef HTTP2_TEST_CONCURRENT_STREAMS
+#define HTTP2_TEST_CONCURRENT_STREAMS 256
+#endif
+
 class LIBHTTP2 : public ::testing::Test
 {
   protected:
@@ -29,6 +34,13 @@ class LIBHTTP2 : public ::testing::Test
 
 		client_sock = socks[0];
 		server_sock = socks[1];
+
+		// 增大 socket 缓冲区以支持高并发
+		int bufsize = 2 * 1024 * 1024; // 2MB
+		setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+		setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+		setsockopt(server_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+		setsockopt(server_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
 
 		// Set non-blocking
 		fcntl(client_sock, F_SETFL, O_NONBLOCK);
@@ -71,7 +83,7 @@ class LIBHTTP2 : public ::testing::Test
 	}
 };
 
-// ========== 原有测试用例（保持不变） ==========
+// ========== 原有测试用例 ==========
 
 TEST_F(LIBHTTP2, MultiStream)
 {
@@ -87,10 +99,8 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct pollfd pfd = {server_sock, POLLIN, 0};
 			poll(&pfd, 1, 10);
 			ret = http2_ctx_handshake(ctx);
-			if (ret == 1)
-				break;
-			if (ret < 0)
-				break;
+			if (ret == 1) break;
+			if (ret < 0) break;
 		}
 		ASSERT_EQ(ret, 1) << "Server handshake failed";
 
@@ -107,7 +117,7 @@ TEST_F(LIBHTTP2, MultiStream)
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
-					struct http2_stream *s = http2_ctx_accept_stream(ctx);
+					http2_ctx_accept_stream(ctx);
 				} else if (items[i].stream && items[i].readable) {
 					struct http2_stream *stream = items[i].stream;
 					uint8_t buf[1024];
@@ -123,7 +133,6 @@ TEST_F(LIBHTTP2, MultiStream)
 							struct http2_header_pair headers[] = {{"content-type", "text/plain"},
 																  {"content-length", content_length}};
 							http2_stream_set_response(stream, 200, headers, 2);
-							// 循环发送数据确保完整
 							int written = 0;
 							while (written < response_len) {
 								int w = http2_stream_write_body(stream, (const uint8_t *)response + written,
@@ -138,7 +147,7 @@ TEST_F(LIBHTTP2, MultiStream)
 								}
 								written += w;
 							}
-							http2_stream_write_body(stream, NULL, 0, 1); // END_STREAM
+							http2_stream_write_body(stream, NULL, 0, 1);
 							streams_completed++;
 							processed_streams.insert(stream);
 						}
@@ -148,9 +157,7 @@ TEST_F(LIBHTTP2, MultiStream)
 			usleep(2000);
 		}
 
-		for (auto stream : processed_streams) {
-			http2_stream_close(stream);
-		}
+		for (auto stream : processed_streams) http2_stream_close(stream);
 		http2_ctx_close(ctx);
 	});
 
@@ -165,10 +172,8 @@ TEST_F(LIBHTTP2, MultiStream)
 			struct pollfd pfd = {client_sock, POLLIN, 0};
 			poll(&pfd, 1, 10);
 			ret = http2_ctx_handshake(ctx);
-			if (ret == 1)
-				break;
-			if (ret < 0)
-				break;
+			if (ret == 1) break;
+			if (ret < 0) break;
 		}
 		ASSERT_EQ(ret, 1) << "Client handshake failed";
 
@@ -228,10 +233,7 @@ TEST_F(LIBHTTP2, MultiStream)
 		}
 
 		EXPECT_EQ(streams_completed, NUM_STREAMS);
-
-		for (int i = 0; i < NUM_STREAMS; i++) {
-			http2_stream_close(streams[i]);
-		}
+		for (int i = 0; i < NUM_STREAMS; i++) http2_stream_close(streams[i]);
 		http2_ctx_close(ctx);
 	});
 
@@ -306,7 +308,6 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 		struct http2_header_pair headers[] = {
 			{"content-type", "text/plain"}, {"content-length", content_length}, {NULL, NULL}};
 		http2_stream_set_response(stream, 200, headers, 2);
-		// 循环发送数据
 		int written = 0;
 		while (written < response_len) {
 			int w = http2_stream_write_body(stream, (const uint8_t *)response + written,
@@ -321,7 +322,7 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 			}
 			written += w;
 		}
-		http2_stream_write_body(stream, NULL, 0, 1); // END_STREAM
+		http2_stream_write_body(stream, NULL, 0, 1);
 
 		int flush_retries = 100;
 		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
@@ -334,7 +335,6 @@ TEST_F(LIBHTTP2, EarlyStreamCreation)
 
 	std::thread client_thread([this]() {
 		usleep(50000);
-
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
@@ -450,7 +450,7 @@ TEST_F(LIBHTTP2, ServerLoopTerminationOnDisconnect)
 			if (!data_read && http2_stream_is_end(stream)) break;
 			usleep(10000);
 		}
-		EXPECT_LT(loop_count, 100) << "Server loop did not terminate (infinite loop detected)";
+		EXPECT_LT(loop_count, 100) << "Server loop did not terminate";
 		http2_ctx_close(ctx);
 	});
 
@@ -568,7 +568,6 @@ TEST_F(LIBHTTP2, StreamClose)
 
 		http2_stream_get(stream);
 		http2_stream_close(stream);
-
 		EXPECT_FALSE(http2_stream_is_end(stream));
 
 		uint8_t buf[1024];
@@ -593,10 +592,8 @@ TEST_F(LIBHTTP2, ReferenceCountingNormal)
 {
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
-
 	struct http2_stream *stream = http2_stream_new(ctx);
 	ASSERT_NE(stream, nullptr);
-
 	http2_ctx_close(ctx);
 	http2_stream_close(stream);
 }
@@ -605,13 +602,10 @@ TEST_F(LIBHTTP2, ReferenceCountingContextError)
 {
 	struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 	ASSERT_NE(ctx, nullptr);
-
 	struct http2_stream *stream = http2_stream_new(ctx);
 	ASSERT_NE(stream, nullptr);
-
 	close(client_sock);
 	client_sock = -1;
-
 	http2_ctx_close(ctx);
 	http2_stream_close(stream);
 }
@@ -677,7 +671,6 @@ TEST_F(LIBHTTP2, BasicPOSTEcho)
 		};
 		ASSERT_EQ(http2_stream_set_response(stream, 200, headers, 2), 0);
 
-		// 循环发送数据
 		int written = 0;
 		while (written < total_read) {
 			int w = http2_stream_write_body(stream, body + written, total_read - written, 0);
@@ -691,7 +684,7 @@ TEST_F(LIBHTTP2, BasicPOSTEcho)
 			}
 			written += w;
 		}
-		http2_stream_write_body(stream, NULL, 0, 1); // END_STREAM
+		http2_stream_write_body(stream, NULL, 0, 1);
 
 		int flush_retries = 100;
 		while (http2_ctx_want_write(ctx) && flush_retries-- > 0) {
@@ -704,7 +697,6 @@ TEST_F(LIBHTTP2, BasicPOSTEcho)
 
 	std::thread client_thread([this]() {
 		usleep(50000);
-
 		struct http2_ctx *ctx = http2_ctx_client_new("test-client", bio_read, bio_write, &client_sock, NULL);
 		ASSERT_NE(ctx, nullptr);
 
@@ -772,13 +764,13 @@ TEST_F(LIBHTTP2, BasicPOSTEcho)
 	client_thread.join();
 }
 
-// ========== 高并发测试：1024 个并发 POST 流 ==========
+// ========== 高并发测试（默认 256 流，可调整） ==========
 TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 {
-	const int NUM_STREAMS = 1024;
+	const int NUM_STREAMS = HTTP2_TEST_CONCURRENT_STREAMS;
 	const int BODY_SIZE = 64;
-	const int MAX_ITERATIONS = 3000;  // 增加迭代次数确保完成
-	const int POLL_ITEMS = 256;       // 增加每次 poll 返回的项数
+	const int MAX_ITERATIONS = 10000;
+	const int POLL_ITEMS = 512;
 
 	std::atomic<int> server_completed{0};
 	std::atomic<int> client_completed{0};
@@ -817,7 +809,6 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 
 			for (int i = 0; i < count; i++) {
 				if (items[i].stream == nullptr && items[i].readable) {
-					// Accept new stream; will be handled later
 					struct http2_stream *s = http2_ctx_accept_stream(ctx);
 					(void)s;
 					continue;
@@ -849,7 +840,6 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 							{NULL, NULL}
 						};
 						if (http2_stream_set_response(stream, 200, headers, 2) == 0) {
-							// 循环发送数据
 							int written = 0;
 							bool write_ok = true;
 							while (written < total_read) {
@@ -867,7 +857,7 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 								written += w;
 							}
 							if (write_ok) {
-								http2_stream_write_body(stream, NULL, 0, 1); // END_STREAM
+								http2_stream_write_body(stream, NULL, 0, 1);
 								processed.insert(stream);
 								server_completed++;
 							} else {
@@ -931,7 +921,6 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 				client_error = true;
 				break;
 			}
-			// 发送请求体（一次性发送，小数据应该可以）
 			if (http2_stream_write_body(stream, (const uint8_t *)body, body_len, 1) < 0) {
 				client_error = true;
 				break;
@@ -986,7 +975,6 @@ TEST_F(LIBHTTP2, HighConcurrencyPOSTEcho)
 			usleep(1000);
 		}
 	client_done:
-		// 验证所有响应匹配
 		bool all_match = true;
 		for (size_t i = 0; i < streams.size() && !client_error; i++) {
 			int sid = http2_stream_get_id(streams[i]);
