@@ -2175,9 +2175,18 @@ static void _http2_ctx_collect_ready_streams(struct http2_ctx *ctx, struct http2
 	int new_count = 0;
  
 	list_for_each_entry_safe(stream, tmp, &ctx->streams, node) {
-		/* Skip closed streams */
+		/* Skip closed streams that have no pending data to deliver.
+		 * A CLOSED stream can still have unread body bytes or an
+		 * unhandled end-stream event (e.g. GET/HEAD: HALF_CLOSED_LOCAL
+		 * → CLOSED when the server's END_STREAM is received).  Those
+		 * must still be surfaced to the application.  Fully drained
+		 * closed streams are left for http2_stream_close() to remove. */
 		if (stream->state == HTTP2_STREAM_CLOSED) {
-			continue;
+			int has_data = (stream->body_buffer_len > stream->body_read_offset);
+			int unhandled_end = (stream->end_stream_received && !stream->end_stream_read_handled);
+			if (!has_data && !unhandled_end) {
+				continue;
+			}
 		}
 		/* Only return streams that have been accepted */
 		if (!stream->accepted) {
@@ -2749,17 +2758,14 @@ int http2_stream_write_body(struct http2_stream *stream, const uint8_t *data, in
 		ctx->connection_send_window -= to_send;
 	}
  
-	/* If all requested bytes were sent and end_stream was set, the last
-	 * DATA frame already carried the END_STREAM flag.  Mark the stream
-	 * accordingly so that http2_stream_close() does not send a redundant
-	 * empty DATA+END_STREAM frame, which would be a protocol error. */
+	/* Mark end_stream as sent once all data has been flushed with END_STREAM.
+	 * IMPORTANT: Do NOT update stream->state here.  CLOSED streams are skipped
+	 * by _http2_ctx_collect_ready_streams(), so transitioning the state would
+	 * prevent the poll loop from surfacing this stream to the application layer
+	 * for response processing.  Setting end_stream_sent is enough to stop
+	 * http2_stream_close() from emitting a spurious empty DATA+END_STREAM frame. */
 	if (end_stream && len == 0) {
 		stream->end_stream_sent = 1;
-		if (stream->state == HTTP2_STREAM_OPEN) {
-			stream->state = HTTP2_STREAM_HALF_CLOSED_LOCAL;
-		} else if (stream->state == HTTP2_STREAM_HALF_CLOSED_REMOTE) {
-			stream->state = HTTP2_STREAM_CLOSED;
-		}
 	}
  
 	pthread_mutex_unlock(&ctx->mutex);
